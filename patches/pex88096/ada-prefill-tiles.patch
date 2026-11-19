@@ -1,0 +1,39 @@
+--- a/vllm/model_executor/kernels/linear/mxfp8/ada.py
++++ b/vllm/model_executor/kernels/linear/mxfp8/ada.py
+@@ -18,10 +18,18 @@
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     kMxfp8Dynamic,
+ )
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+ from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
++
++
++logger = init_logger(__name__)
++_ADA_DSV41_PREFILL_8K_SHAPES = frozenset({
++    (5120, 1152), (5120, 1792), (1024, 5120),
++    (2048, 5120), (1280, 4096), (1280, 8192),
++})
+ 
+ 
+ @triton.jit
+@@ -259,6 +267,17 @@
+         rows = xq.shape[0]
+         output = torch.empty((rows, output_size), dtype=output_dtype, device=xq.device)
+         block_m, block_n, split_k = self._launch_config(rows, input_size, output_size)
++        # On SM89 this measured tile preserves the K32 loop and scaling order.
++        if (
++            rows == 8192
++            and split_k == 1
++            and (input_size, output_size) in _ADA_DSV41_PREFILL_8K_SHAPES
++        ):
++            block_m, block_n = 128, 64
++            logger.info_once(
++                "Ada MXFP8 8192-row prefill tile 128x64 active for %d x %d",
++                input_size, output_size,
++            )
+         output_tiles = triton.cdiv(rows, block_m) * triton.cdiv(output_size, block_n)
+         partial = (
+             output

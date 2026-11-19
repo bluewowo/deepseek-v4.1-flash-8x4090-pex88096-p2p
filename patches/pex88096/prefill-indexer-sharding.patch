@@ -1,0 +1,311 @@
+diff -ur old/vllm/distributed/parallel_state.py new/vllm/distributed/parallel_state.py
+--- old/vllm/distributed/parallel_state.py
++++ new/vllm/distributed/parallel_state.py
+@@ -1609,6 +1609,16 @@
+ 
+ 
+ _TP: GroupCoordinator | None = None
++_DSV41_PREFILL_INDEXER: GroupCoordinator | None = None
++
++
++def get_dsv41_prefill_indexer_group(shards: int) -> GroupCoordinator | None:
++    if shards == 8 and _TP is not None and _TP.world_size == 8:
++        return _TP
++    if shards == 4 and _DSV41_PREFILL_INDEXER is not None and _TP is not None:
++        if set(_DSV41_PREFILL_INDEXER.ranks).issubset(_TP.ranks):
++            return _DSV41_PREFILL_INDEXER
++    return None
+ 
+ 
+ def get_tp_group() -> GroupCoordinator:
+@@ -2216,6 +2226,32 @@
+         group_name="tp",
+     )
+ 
++    shards = envs.VLLM_DSV41_PREFILL_INDEXER_TP
++    if shards not in (0, 4, 8):
++        raise ValueError("VLLM_DSV41_PREFILL_INDEXER_TP must be 0, 4 or 8")
++    if shards:
++        if (
++            tensor_model_parallel_size != 8
++            or enable_elastic_ep
++            or decode_context_model_parallel_size != 1
++            or prefill_context_model_parallel_size != 1
++        ):
++            raise ValueError("V4.1 prefill indexer sharding requires TP8 and no CP")
++        if shards == 4:
++            global _DSV41_PREFILL_INDEXER
++            indexer_ranks = [
++                ranks[start : start + 4]
++                for ranks in group_ranks
++                for start in range(0, len(ranks), 4)
++            ]
++            _DSV41_PREFILL_INDEXER = init_model_parallel_group(
++                indexer_ranks,
++                get_world_group().local_rank,
++                backend,
++                group_name="dsv41_prefill_indexer",
++            )
++            logger.info("V4.1 prefill indexer groups: %s", indexer_ranks)
++
+     global _ETP
+     assert _ETP is None, "Engram tensor-parallel group is already initialized"
+     engram_tensor_parallel_size = (
+@@ -2528,7 +2564,11 @@
+ 
+ def destroy_model_parallel():
+     """Set the groups to none and destroy them."""
+-    global _TP, _ETP
++    global _TP, _ETP, _DSV41_PREFILL_INDEXER
++
++    if _DSV41_PREFILL_INDEXER is not None:
++        _DSV41_PREFILL_INDEXER.destroy()
++        _DSV41_PREFILL_INDEXER = None
+ 
+     if _ETP and _ETP is not _TP:
+         _ETP.destroy()
+diff -ur old/vllm/envs.py new/vllm/envs.py
+--- old/vllm/envs.py
++++ new/vllm/envs.py
+@@ -61,6 +61,7 @@
+     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+     VLLM_USE_FUSED_MQA_TOPK: bool = True
+     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
++    VLLM_DSV41_PREFILL_INDEXER_TP: int = 0
+     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
+     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+     VLLM_XPU_PP_MICROBATCH: bool = True
+@@ -1147,6 +1148,9 @@
+     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
+     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
+     # Default: 512 MB
++    "VLLM_DSV41_PREFILL_INDEXER_TP": lambda: int(
++        os.getenv("VLLM_DSV41_PREFILL_INDEXER_TP", "0")
++    ),
+     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
+         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+     ),
+diff -ur old/vllm/model_executor/layers/sparse_attn_indexer.py new/vllm/model_executor/layers/sparse_attn_indexer.py
+--- old/vllm/model_executor/layers/sparse_attn_indexer.py
++++ new/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -3,6 +3,7 @@
+ """Custom Sparse Attention Indexer layers."""
+ 
+ import math
++from contextlib import contextmanager
+ 
+ import torch
+ import torch.distributed as dist
+@@ -19,6 +20,7 @@
+ )
+ from vllm.distributed import (
+     get_dcp_group,
++    get_dsv41_prefill_indexer_group,
+     get_pcp_group,
+ )
+ from vllm.forward_context import get_forward_context
+@@ -603,6 +605,39 @@
+     return rows
+ 
+ 
++@contextmanager
++def _dsv41_shard_prefill_rows(topk, candidates, candidate_write, width):
++    rows, topk_width = topk.shape
++    shards = envs.VLLM_DSV41_PREFILL_INDEXER_TP
++    group = get_dsv41_prefill_indexer_group(shards)
++    if group is None or rows < 128 or width < 8192:
++        yield 0, rows, topk, candidates
++        return
++
++    logger.info_once("V4.1 prefill indexer sharding active (TP%d)", shards)
++    rows_per_rank = (rows + shards - 1) // shards
++    first = min(group.rank_in_group * rows_per_rank, rows)
++    last = min(first + rows_per_rank, rows)
++    candidate_width = candidates.shape[1] if candidate_write else 0
++    local = topk.new_full((rows_per_rank * (topk_width + candidate_width),), -1)
++    topk_elements = rows_per_rank * topk_width
++    local_topk = local[:topk_elements].view(rows_per_rank, topk_width)[: last - first]
++    if candidate_write:
++        local_candidates = local[topk_elements:].view(rows_per_rank, candidate_width)[
++            : last - first
++        ]
++    else:
++        local_candidates = candidates[first:last] if candidates is not None else None
++    yield first, last, local_topk, local_candidates
++
++    gathered = group.all_gather(local, dim=0).view(shards, -1)
++    topk.copy_(gathered[:, :topk_elements].reshape(-1, topk_width)[:rows])
++    if candidate_write:
++        candidates.copy_(
++            gathered[:, topk_elements:].reshape(-1, candidate_width)[:rows]
++        )
++
++
+ def _dsv41_native_indexer(
+     attn_metadata: DeepseekV32IndexerMetadata,
+     kv_cache: torch.Tensor,
+@@ -652,88 +687,97 @@
+                 logits_scratch.numel(),
+                 needs_block_scores=candidate_blocks is not None and candidate_write,
+             )
+-            num_rows = chunk.token_end - chunk.token_start
+-            for row_offset in range(0, num_rows, rows_per_chunk):
+-                token_start = chunk.token_start + row_offset
+-                token_end = min(token_start + rows_per_chunk, chunk.token_end)
+-                rows = token_end - token_start
+-                local_rows = slice(row_offset, row_offset + rows)
+-                q_values = q_quant[token_start:token_end]
+-                q_scales = q_scale[token_start:token_end]
+-                chunk_weights = weights[token_start:token_end]
+-                topk_indices = topk_indices_buffer[token_start:token_end, :topk_tokens]
+-                chunk_candidates = (
+-                    candidate_blocks[token_start:token_end]
+-                    if candidate_blocks is not None
+-                    else None
+-                )
+-                logits_out = logits_scratch[: rows * width].view(rows, width)
+-                if reads_candidates:
+-                    assert chunk_candidates is not None
+-                    logits = dsv41_mxfp4_candidate_logits(
++            all_topk = topk_indices_buffer[
++                chunk.token_start : chunk.token_end, :topk_tokens
++            ]
++            all_candidates = (
++                candidate_blocks[chunk.token_start : chunk.token_end]
++                if candidate_blocks is not None
++                else None
++            )
++            with _dsv41_shard_prefill_rows(
++                all_topk, all_candidates, candidate_write, width
++            ) as (first, last, shard_topk, shard_candidates):
++                for row_offset in range(first, last, rows_per_chunk):
++                    token_start = chunk.token_start + row_offset
++                    token_end = min(token_start + rows_per_chunk, chunk.token_start + last)
++                    rows = token_end - token_start
++                    local_rows = slice(row_offset, row_offset + rows)
++                    q_values = q_quant[token_start:token_end]
++                    q_scales = q_scale[token_start:token_end]
++                    chunk_weights = weights[token_start:token_end]
++                    shard_rows = slice(row_offset - first, row_offset - first + rows)
++                    topk_indices = shard_topk[shard_rows]
++                    chunk_candidates = (
++                        shard_candidates[shard_rows] if shard_candidates is not None else None
++                    )
++                    logits_out = logits_scratch[: rows * width].view(rows, width)
++                    if reads_candidates:
++                        assert chunk_candidates is not None
++                        logits = dsv41_mxfp4_candidate_logits(
++                            q_values,
++                            q_scales,
++                            kv_cache,
++                            chunk_weights,
++                            chunk.block_table,
++                            chunk.cu_seqlen_ke[local_rows],
++                            chunk_candidates,
++                            row_starts=chunk.cu_seqlen_ks[local_rows],
++                            cu_seq_lens=chunk.cu_seq_lens,
++                            token_to_seq=chunk.token_to_seq,
++                            out=logits_out,
++                        )
++                        _dsv41_topk_from_candidates(
++                            logits,
++                            chunk_candidates,
++                            topk_indices,
++                            topk_workspace,
++                            lengths_scratch,
++                        )
++                        continue
++
++                    logits = dsv41_mxfp4_dense_logits(
+                         q_values,
+                         q_scales,
+                         kv_cache,
+                         chunk_weights,
+                         chunk.block_table,
+                         chunk.cu_seqlen_ke[local_rows],
+-                        chunk_candidates,
++                        width,
+                         row_starts=chunk.cu_seqlen_ks[local_rows],
+                         cu_seq_lens=chunk.cu_seq_lens,
+                         token_to_seq=chunk.token_to_seq,
+                         out=logits_out,
+                     )
+-                    _dsv41_topk_from_candidates(
+-                        logits,
+-                        chunk_candidates,
+-                        topk_indices,
+-                        topk_workspace,
+-                        lengths_scratch,
+-                    )
+-                    continue
+-
+-                logits = dsv41_mxfp4_dense_logits(
+-                    q_values,
+-                    q_scales,
+-                    kv_cache,
+-                    chunk_weights,
+-                    chunk.block_table,
+-                    chunk.cu_seqlen_ke[local_rows],
+-                    width,
+-                    row_starts=chunk.cu_seqlen_ks[local_rows],
+-                    cu_seq_lens=chunk.cu_seq_lens,
+-                    token_to_seq=chunk.token_to_seq,
+-                    out=logits_out,
+-                )
+-                if chunk_candidates is not None:
+-                    num_blocks = (
+-                        width + candidate_block_size - 1
+-                    ) // candidate_block_size
+-                    score_width = max(chunk_candidates.shape[1], num_blocks)
+-                    scores_out = block_scores_scratch[: rows * score_width].view(
+-                        rows, score_width
+-                    )
+-                    _select_dsv41_candidate_blocks(
++                    if chunk_candidates is not None:
++                        num_blocks = (
++                            width + candidate_block_size - 1
++                        ) // candidate_block_size
++                        score_width = max(chunk_candidates.shape[1], num_blocks)
++                        scores_out = block_scores_scratch[: rows * score_width].view(
++                            rows, score_width
++                        )
++                        _select_dsv41_candidate_blocks(
++                            logits,
++                            chunk.cu_seqlen_ks[local_rows],
++                            chunk.cu_seqlen_ke[local_rows],
++                            chunk_candidates.shape[1],
++                            candidate_block_size,
++                            chunk_candidates,
++                            topk_workspace,
++                            scores_out=scores_out,
++                            block_lens_out=lengths_scratch[:rows],
++                        )
++                    ops.top_k_per_row_prefill(
+                         logits,
+                         chunk.cu_seqlen_ks[local_rows],
+                         chunk.cu_seqlen_ke[local_rows],
+-                        chunk_candidates.shape[1],
+-                        candidate_block_size,
+-                        chunk_candidates,
+-                        topk_workspace,
+-                        scores_out=scores_out,
+-                        block_lens_out=lengths_scratch[:rows],
++                        topk_indices,
++                        rows,
++                        logits.stride(0),
++                        logits.stride(1),
++                        topk_tokens,
+                     )
+-                ops.top_k_per_row_prefill(
+-                    logits,
+-                    chunk.cu_seqlen_ks[local_rows],
+-                    chunk.cu_seqlen_ke[local_rows],
+-                    topk_indices,
+-                    rows,
+-                    logits.stride(0),
+-                    logits.stride(1),
+-                    topk_tokens,
+-                )
+ 
+     if attn_metadata.num_decodes > 0:
+         assert attn_metadata.decode is not None

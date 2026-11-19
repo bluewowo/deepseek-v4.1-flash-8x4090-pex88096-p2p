@@ -1,0 +1,163 @@
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -3,6 +3,7 @@
+ """Custom Sparse Attention Indexer layers."""
+ 
+ import math
++import os
+ from contextlib import contextmanager
+ 
+ import torch
+@@ -638,6 +639,36 @@
+         )
+ 
+ 
++@contextmanager
++def _dsv41_shard_decode_rows(group, topk, candidates):
++    """Shard whole flattened query rows after their projections and packing."""
++    rows, topk_width = topk.shape
++    if group is None or rows < 4:
++        yield slice(0, rows), topk, candidates
++        return
++
++    world = group.world_size
++    rows_per_rank = (rows + world - 1) // world
++    first = min(group.rank_in_group * rows_per_rank, rows)
++    last = min(first + rows_per_rank, rows)
++    count = last - first
++    candidate_width = candidates.shape[1] if candidates is not None else 0
++    local_topk_elements = rows_per_rank * topk_width
++    local = topk.new_full((rows_per_rank * (topk_width + candidate_width),), -1)
++    local_topk = local[:local_topk_elements].view(rows_per_rank, topk_width)
++    local_candidates = None
++    if candidates is not None:
++        local_candidates = local[local_topk_elements:].view(rows_per_rank, candidate_width)
++        local_candidates = local_candidates[:count]
++    yield slice(first, last), local_topk[:count], local_candidates
++
++    gathered = group.all_gather(local, dim=0).view(world, -1)
++    topk.copy_(gathered[:, :local_topk_elements].reshape(-1, topk_width)[:rows])
++    if candidates is not None:
++        candidate_rows = gathered[:, local_topk_elements:].reshape(-1, candidate_width)
++        candidates.copy_(candidate_rows[:rows])
++
++
+ def _dsv41_native_indexer(
+     attn_metadata: DeepseekV32IndexerMetadata,
+     kv_cache: torch.Tensor,
+@@ -849,6 +880,22 @@
+             needs_block_scores=padded_candidates is not None and candidate_write,
+             group_size=next_n,
+         )
++
++        # A single request per flattened query row lets the shard retain the
++        # existing block-table and causal-length mapping. Full graph capture
++        # uses the configured maximum width rather than the live KV length.
++        decode_shard_group = None
++        if (
++            os.environ.get("DS1017_DECODE_INDEXER_TP8") == "1"
++            and attn_metadata.num_prefills == 0
++            and not decode_metadata.requires_padding
++            and not reads_candidates
++            and next_n == 1
++            and width >= 131072
++        ):
++            decode_shard_group = get_dsv41_prefill_indexer_group(8)
++            if decode_shard_group is not None and batch_size >= 4:
++                logger.info_once("V4.1 dense decode indexer query rows partitioned over TP8")
+         requests_per_chunk = rows_per_chunk // next_n
+         for request_start in range(0, batch_size, requests_per_chunk):
+             request_end = min(request_start + requests_per_chunk, batch_size)
+@@ -888,42 +935,59 @@
+                 )
+                 continue
+ 
+-            logits = dsv41_mxfp4_dense_logits(
+-                q_values,
+-                q_scales,
+-                kv_cache,
+-                chunk_weights,
+-                decode_metadata.block_table[request_slice],
+-                chunk_seq_lens,
+-                width,
+-                row_repeat=next_n,
+-                out=logits_out,
+-            )
+-            if chunk_candidates is not None:
+-                num_blocks = (width + candidate_block_size - 1) // candidate_block_size
+-                score_width = max(chunk_candidates.shape[1], num_blocks)
+-                scores_out = block_scores_scratch[: rows * score_width].view(
+-                    rows, score_width
+-                )
+-                _select_dsv41_candidate_blocks(
++            with _dsv41_shard_decode_rows(
++                decode_shard_group, chunk_topk_indices, chunk_candidates
++            ) as (owned, owned_topk, owned_candidates):
++                local_rows = owned.stop - owned.start
++                if local_rows == 0:
++                    continue
++                if decode_shard_group is not None and rows >= 4:
++                    q_values = q_values[owned]
++                    q_scales = q_scales[owned]
++                    chunk_weights = chunk_weights[owned]
++                    chunk_seq_lens = chunk_seq_lens[owned]
++                    request_slice = slice(
++                        request_start + owned.start, request_start + owned.stop
++                    )
++                    logits_out = logits_scratch[: local_rows * width].view(
++                        local_rows, width
++                    )
++                logits = dsv41_mxfp4_dense_logits(
++                    q_values,
++                    q_scales,
++                    kv_cache,
++                    chunk_weights,
++                    decode_metadata.block_table[request_slice],
++                    chunk_seq_lens,
++                    width,
++                    row_repeat=next_n,
++                    out=logits_out,
++                )
++                if owned_candidates is not None:
++                    num_blocks = (width + candidate_block_size - 1) // candidate_block_size
++                    score_width = max(owned_candidates.shape[1], num_blocks)
++                    scores_out = block_scores_scratch[: local_rows * score_width].view(
++                        local_rows, score_width
++                    )
++                    _select_dsv41_candidate_blocks(
++                        logits,
++                        None,
++                        chunk_seq_lens,
++                        owned_candidates.shape[1],
++                        candidate_block_size,
++                        owned_candidates,
++                        topk_workspace,
++                        scores_out=scores_out,
++                        block_lens_out=lengths_scratch[:local_rows],
++                    )
++                torch.ops._C.persistent_topk(
+                     logits,
+-                    None,
+                     chunk_seq_lens,
+-                    chunk_candidates.shape[1],
+-                    candidate_block_size,
+-                    chunk_candidates,
++                    owned_topk,
+                     topk_workspace,
+-                    scores_out=scores_out,
+-                    block_lens_out=lengths_scratch[:rows],
+-                )
+-            torch.ops._C.persistent_topk(
+-                logits,
+-                chunk_seq_lens,
+-                chunk_topk_indices,
+-                topk_workspace,
+-                topk_tokens,
+-                width,
+-            )
++                    topk_tokens,
++                    width,
++                )
+ 
+         if decode_metadata.requires_padding:
+             unpacked = unpack_seq_triton(

@@ -1,3 +1,19 @@
+# DeepSeek V4.1 Flash 1017 · 8×4090 48 GB · PEX88096 P2P
+
+双 PEX88096 的单机八卡部署。包含 CUDA P2P 配置、预填充和解码的 indexer 行分片、
+Ada 预填充 tile、固定依赖和冷 prefill 基准脚本。
+
+在八张 48 GB RTX 4090 上，512K 单流冷 prefill 实测约 **10,700 tok/s**。
+配置窗口是 **1,048,576 token**，测试卷的前缀缓存命中为零。
+
+[PEX88096 安装与实测](docs/pex88096.md) · [运行配置示例](profiles/pex88096.env.example) · [上游项目](https://github.com/ykk648/deepseek-v4.1-flash-8x4090)
+
+The PEX88096 profile adds a peer-to-peer transport configuration and SM89
+inference patches. See the [setup guide](docs/pex88096.md) for the exact runtime
+and benchmark scope. The original deployment notes follow.
+
+---
+
 # 8 x RTX 4090 48GB 部署 DeepSeek-V4.1-Flash-1017：256K 实测与优化
 
 > 在无 NVLink、无 CUDA P2P、双 NUMA 的单机 8 卡环境中，记录

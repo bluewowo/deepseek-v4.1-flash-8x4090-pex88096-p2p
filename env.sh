@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$PROJECT_DIR/.env" ]]; then
-  # shellcheck disable=SC1091
-  source "$PROJECT_DIR/.env"
+env_file="${ENV_FILE:-$PROJECT_DIR/.env}"
+if [[ -n "${ENV_FILE:-}" && ! -r "$env_file" ]]; then
+  echo "Configuration is not readable: $env_file" >&2
+  return 1
+fi
+if [[ -f "$env_file" ]]; then
+  # shellcheck disable=SC1090
+  source "$env_file"
 fi
 
 export VIRTUAL_ENV="${VENV:-$PROJECT_DIR/.venv}"

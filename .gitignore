@@ -23,3 +23,10 @@ models/
 model-config/
 benchmark-results/
 results/local/
+
+# Local PEX88096 assets
+.venv-pex88096/
+overlays/
+wheels/
+*.whl
+*.safetensors

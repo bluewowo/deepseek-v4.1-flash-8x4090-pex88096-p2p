@@ -39,7 +39,8 @@ MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/models/DeepSeek-V4.1-Flash-1017}"
 : "${ENABLE_VISION:=1}"
 : "${MAX_IMAGES_PER_PROMPT:=2}"
 
-export CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE=1
+: "${NCCL_P2P_DISABLE:=1}"
+export CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE
 
 args=(
   serve "$MODEL_DIR"
@@ -49,7 +50,6 @@ args=(
   --trust-remote-code
   --tensor-parallel-size 8
   --distributed-executor-backend mp
-  --disable-custom-all-reduce
   --enable-expert-parallel
   --moe-backend auto
   --kv-cache-dtype fp8
@@ -60,12 +60,25 @@ args=(
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --engram-config '{"cpu_offload":true}'
   --load-format safetensors
-  --safetensors-load-strategy lazy
   --tokenizer-mode deepseek_v41
   --reasoning-parser deepseek_v41
   --enable-auto-tool-choice
   --tool-call-parser deepseek_v41
 )
+
+if [[ "${PEX88096_PROFILE:-0}" == "1" ]]; then
+  overlay="$PROJECT_DIR/overlays/pex88096-vision14"
+  if [[ ! -x "$VIRTUAL_ENV/bin/vllm" || ! -s "$overlay/vllm/__init__.py" ]]; then
+    echo "Run ./setup_pex88096.sh before using the PEX88096 profile." >&2
+    exit 1
+  fi
+  export PYTHONPATH="$overlay${PYTHONPATH:+:$PYTHONPATH}"
+  args+=(--safetensors-load-strategy prefetch --safetensors-prefetch-num-threads 2)
+  args+=(--no-enable-extensible-kv-cache --prefill-schedule-interval 1)
+  args+=(--compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":48}')
+else
+  args+=(--disable-custom-all-reduce --safetensors-load-strategy lazy)
+fi
 
 if [[ "$ENABLE_VISION" == "1" ]]; then
   if [[ ! "$MAX_IMAGES_PER_PROMPT" =~ ^[1-9][0-9]*$ ]]; then
@@ -90,7 +103,11 @@ fi
 if [[ "$ENABLE_DSPARK" == "1" ]]; then
   adaptive=false
   [[ "$ENABLE_ADAPTIVE_VERIFICATION" == "1" ]] && adaptive=true
-  args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$adaptive}")
+  draft_tp=""
+  if [[ "${PEX88096_PROFILE:-0}" == "1" ]]; then
+    draft_tp=',"draft_tensor_parallel_size":8'
+  fi
+  args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$NUM_SPECULATIVE_TOKENS,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$adaptive$draft_tp}")
 fi
 
 echo "Starting $SERVED_MODEL_NAME on GPUs $CUDA_VISIBLE_DEVICES"
