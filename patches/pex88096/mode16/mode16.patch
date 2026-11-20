@@ -1,0 +1,377 @@
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -459,7 +459,14 @@
+             norm_eps=self.ffn_norm.variance_epsilon,
+             projection_rows=projection_rows,
+         )
+-        if ada_sp_mode:
++        narrow_ffn_output = None
++        if ada_ffn_reduce_scatter == 2:
++            from .ada_ffn_gather import maybe_narrow_ffn
++
++            narrow_ffn_output = maybe_narrow_ffn(self.ffn, x, input_ids, sp_all_gather)
++        if narrow_ffn_output is not None:
++            x = narrow_ffn_output
++        elif ada_sp_mode:
+             full_ffn_input = sp_all_gather(x)
+             if ada_ffn_reduce_scatter:
+                 x = self.ffn(
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
++from pathlib import Path
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -898,6 +900,79 @@
+ 
+         return num_new_tokens
+ 
++    def _mixed_prefill_plan(
++        self, input_budget: int, draft_slots: int
++    ) -> tuple[int | None, str]:
++        switch = os.getenv("DS1017_MIXED_PREFILL_SWITCH")
++        if not switch or not self.scheduler_config.enable_chunked_prefill:
++            return None, "mixed"
++        ready_decode = [
++            request for request in self.running
++            if request.num_output_tokens > 0
++            and not request.is_prefill_chunk
++            and not request.mm_features
++            and request.next_decode_eligible_step <= self.current_step
++            and request.num_tokens_with_spec + request.num_output_placeholders
++                > request.num_computed_tokens
++            and request.num_output_tokens < request.max_tokens
++        ]
++        if not ready_decode:
++            return None, "mixed"
++        longest = max(
++            (request.num_prompt_tokens for queue in (self.running, self.waiting)
++             for request in queue if request.num_output_tokens == 0
++             and not request.mm_features
++             and request.num_computed_tokens + 1 < request.num_prompt_tokens),
++            default=0,
++        )
++        if longest < 250_000:
++            return None, "mixed"
++        mode = Path(switch).read_text().strip()
++        if mode == "base":
++            return None, "mixed"
++        if mode in ("burst4", "burst8", "burst8late"):
++            unfinished = [
++                request for queue in (self.running, self.waiting) for request in queue
++                if request.num_output_tokens == 0
++                and request.num_computed_tokens < request.num_prompt_tokens
++            ]
++            if any(r.mm_features for r in (*self.running, *self.waiting)):
++                return None, "mixed"
++            long_running = [r for r in self.running if r.num_prompt_tokens >= 250_000
++                            and r.num_computed_tokens < r.num_prompt_tokens]
++            if mode == "burst8late" and len(long_running) == 1:
++                late = [r for r in unfinished if r is not long_running[0]]
++                if late and all(r.num_prompt_tokens <= 16_384 for r in late):
++                    # At most two short-prefill steps before advancing the
++                    # long request. This covers an 8K prompt plus the tail
++                    # left when decode rows consume part of the first budget.
++                    short_turns = getattr(self, "_ds1017_short_turns", 0)
++                    return None, "short" if short_turns < 2 else "prefill"
++            if len(unfinished) != 1 or len(self.running) + len(self.waiting) < 2:
++                return None, "mixed"
++            if self.prefill_capacity_bound:
++                return None, "mixed"
++            burst = 4 if mode == "burst4" else 8
++            last = getattr(self, "_ds1017_last_prefill_burst", -burst)
++            if self.num_executed_steps - last < burst:
++                return None, "decode"
++            return None, "prefill"
++        if mode == "adaptive":
++            cap = 2048 if longest >= 500_000 else 4096
++        else:
++            cap = {"cap4k": 4096, "cap2k": 2048}[mode]
++        # Cap the total mixed step while reserving actual decode rows and
++        # the scheduler's per-request draft slots. The original scheduler
++        # still owns request order, KV allocation, and model-length checks.
++        decode_input = sum(
++            min(1 + self.num_spec_tokens,
++                request.num_tokens_with_spec + request.num_output_placeholders
++                - request.num_computed_tokens)
++            for request in ready_decode
++        )
++        budget = min(input_budget, cap + decode_input + (len(ready_decode) + 1) * draft_slots)
++        return budget, "mixed"
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+@@ -993,10 +1068,28 @@
+         ):
+             defer_prefills = True
+ 
++        mixed_limit, lane = self._mixed_prefill_plan(input_budget, draft_slots)
++        if lane != "mixed":
++            logger.info_once("DS1017 burst8late active lane=%s", lane)
++        if lane == "decode":
++            defer_prefills = True
++        if mixed_limit is not None:
++            input_budget = mixed_limit
++            long_prefill_token_threshold = min(
++                long_prefill_token_threshold or mixed_limit, mixed_limit
++            )
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++            if lane == "prefill" and request.num_prompt_tokens < 250_000:
++                req_index += 1
++                continue
++            if (lane == "short" and request.num_prompt_tokens >= 250_000
++                    and request.num_computed_tokens < request.num_prompt_tokens):
++                req_index += 1
++                continue
+             if input_budget <= draft_slots:
+                 break
+ 
+@@ -1956,6 +2049,13 @@
+ 
+         # Restart the cadence interval from any step that carried prefill,
+         # whether a new admission or a running chunk.
++        if lane == "prefill":
++            # Yield to decode even if KV allocation prevented this prefill
++            # launch. The engine may immediately try the next nonempty step.
++            self._ds1017_last_prefill_burst = self.num_executed_steps
++            self._ds1017_short_turns = 0
++        elif lane == "short":
++            self._ds1017_short_turns = getattr(self, "_ds1017_short_turns", 0) + 1
+         if self.local_prefill_interval > 1 and (prefill_scheduled or prefill_admitted):
+             self.last_prefill_step = self.num_executed_steps
+ 
+@@ -2092,6 +2192,18 @@
+         if self.defer_block_free and total_num_scheduled_tokens > 0:
+             self.sched_step_seq += 1
+ 
++        if os.getenv("DS1017_SCHED_TIMELINE") and total_num_scheduled_tokens:
++            prefill_rows = sum(
++                min(count, max(0, self.requests[req_id].num_prompt_tokens
++                               - self.requests[req_id].num_computed_tokens))
++                for req_id, count in num_scheduled_tokens.items()
++            )
++            self._ds1017_steps = getattr(self, "_ds1017_steps", {})
++            self._ds1017_steps[id(scheduler_output)] = (
++                scheduled_timestamp, prefill_rows,
++                total_num_scheduled_tokens - prefill_rows,
++                len(num_scheduled_tokens), mixed_limit or 0,
++            )
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+@@ -2562,6 +2674,12 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        timeline = getattr(self, "_ds1017_steps", None)
++        if timeline is not None:
++            step = timeline.pop(id(scheduler_output), None)
++            if step is not None:
++                logger.info("DS1017_STEP %.9f %.9f %d %d %d %d",
++                            step[0], time.monotonic(), *step[1:])
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/nvidia/ada_ffn_gather.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++"""SM89 experimental sequence-parallel FFN input gather for 1017."""
++import os
++from pathlib import Path
++
++import torch
++
++from vllm.distributed import get_tp_group
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fusion.quant_activation import (
++    QuantizedActivation, get_input_quant_key,
++)
++from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
++    mxfp8_e4m3_quantize, mxfp8_quantize_dequantize,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
++from vllm.triton_utils import tl, triton
++
++logger = init_logger(__name__)
++SWITCH = os.getenv("DS1017_ADA_FFN_GATHER_SWITCH")
++LOCAL_ROWS = 1024
++ROWS = LOCAL_ROWS * 8
++HIDDEN = 5120
++SCALES = HIDDEN // 32
++ROUTES = 6
++ACTIVATION_BYTES = HIDDEN + SCALES
++PACKET_BYTES = ACTIVATION_BYTES + 2 * ROUTES * 4
++
++
++@triton.jit
++def _unpack(packet, q, scales, bf, H: tl.constexpr, P: tl.constexpr):
++    rows = tl.program_id(0) * 16 + tl.arange(0, 16)
++    groups = tl.program_id(1) * 8 + tl.arange(0, 8)
++    cols = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
++    bits = tl.load(packet + rows[:, None, None] * P + cols[None, :, :])
++    exp = tl.load(packet + rows[:, None] * P + H + groups[None, :])
++    decoded = bits.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    scale = tl.exp2(exp.to(tl.float32) - 127.0)
++    bf16 = (decoded * scale[:, :, None]).to(tl.bfloat16)
++    offset = rows[:, None, None] * H + cols[None, :, :]
++    tl.store(q + offset, bits)
++    tl.store(scales + rows[:, None] * (H // 32) + groups[None, :], exp)
++    tl.store(bf + offset, bf16)
++
++
++def _route(runner, x, token_ids, rank, gate_rows):
++    if gate_rows != LOCAL_ROWS:
++        # For an 8192-row gate, retain the original tile coordinates while
++        # sourcing the rank's activation rows only from its local shard.
++        start = rank * LOCAL_ROWS % gate_rows
++        gate_input = torch.zeros((gate_rows, HIDDEN), dtype=x.dtype, device=x.device)
++        gate_input.narrow(0, start, LOCAL_ROWS).copy_(x)
++        logits, _ = runner.gate(gate_input)
++        logits = logits.narrow(0, start, LOCAL_ROWS)
++    else:
++        logits, _ = runner.gate(x)
++    return runner.router.select_experts(
++        hidden_states=x, router_logits=logits,
++        topk_indices_dtype=runner._quant_method.topk_indices_dtype,
++        input_ids=token_ids,
++    )
++
++
++def _bits_equal(a, b):
++    return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
++
++
++def _bf16_diff(a, b):
++    if _bits_equal(a, b):
++        return 0, 0.0
++    changed = int((a.view(torch.int16) != b.view(torch.int16)).count_nonzero().item())
++    max_diff = float((a - b).abs().amax().item())
++    return changed, max_diff
++
++
++def maybe_narrow_ffn(ffn, x, token_ids, sp_all_gather):
++    if not SWITCH:
++        return None
++    mode = Path(SWITCH).read_text().strip()
++    if mode == "base":
++        return None
++    if mode not in ("audit", "audit-padded", "audit-padded-trace", "narrow", "narrow-padded"):
++        raise ValueError(f"Unknown 1017 FFN gather mode {mode}")
++    assert x.shape == (LOCAL_ROWS, HIDDEN) and x.dtype == torch.bfloat16
++    assert token_ids is not None and token_ids.shape == (ROWS,)
++    tp = get_tp_group()
++    runner = ffn.experts
++    cfg = runner.moe_config
++    # The model TP communicator has eight ranks. Inside EP, each expert
++    # occupies a single GPU, so the expert module's own TP size is one.
++    assert tp.world_size == cfg.ep_size == 8 and cfg.tp_size == 1
++    assert cfg.moe_parallel_config.ep_rank == tp.rank_in_group
++    assert cfg.dp_size == cfg.pcp_size == 1 and not cfg.is_sequence_parallel
++    assert not runner.do_naive_dispatch_combine and not runner._fse_fuse_gate
++    assert not runner._fused_output_is_reduced and runner.routed_output_transform is None
++    assert runner.gate is not None and runner._shared_experts is not None
++    shared_expert = runner._shared_experts._layer
++    assert get_input_quant_key(shared_expert.gate_up_proj) == kMxfp8Dynamic
++    runner.routed_experts._ensure_moe_quant_config_init()
++    rank = tp.rank_in_group
++    local_ids = token_ids.narrow(0, rank * LOCAL_ROWS, LOCAL_ROWS)
++    weights, ids = _route(runner, x, local_ids, rank, ROWS if "padded" in mode else LOCAL_ROWS)
++    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
++    assert weights.shape == ids.shape == (LOCAL_ROWS, ROUTES)
++    q, scale = mxfp8_e4m3_quantize(x, min_amax=1e-4)
++    local_packet = torch.cat(
++        (q.view(torch.uint8), scale, weights.contiguous().view(torch.uint8),
++         ids.contiguous().view(torch.uint8)), dim=1,
++    )
++    assert local_packet.shape[1] == PACKET_BYTES
++    packet = sp_all_gather(local_packet)
++    q_bytes = torch.empty((ROWS, HIDDEN), device=x.device, dtype=torch.uint8)
++    scales = torch.empty((ROWS, SCALES), device=x.device, dtype=torch.uint8)
++    bf = torch.empty((ROWS, HIDDEN), device=x.device, dtype=torch.bfloat16)
++    _unpack[(ROWS // 16, SCALES // 8)](packet, q_bytes, scales, bf, HIDDEN, PACKET_BYTES)
++    route_ids_byte = ACTIVATION_BYTES + 4 * ROUTES
++    weights = packet[:, ACTIVATION_BYTES:route_ids_byte].contiguous().view(torch.float32)
++    ids = packet[:, route_ids_byte:].contiguous().view(torch.int32)
++    del packet, local_packet
++    audit = mode.startswith("audit")
++    diagnose = mode == "audit-padded-trace"
++    if audit:
++        full = sp_all_gather(x)
++        original = ffn(full, token_ids, ada_prefill_reduce_scatter=2)
++        full_logits, _ = runner.gate(full)
++        ref_weights, ref_ids = runner.router.select_experts(
++            hidden_states=full, router_logits=full_logits,
++            topk_indices_dtype=runner._quant_method.topk_indices_dtype, input_ids=token_ids,
++        )
++        ref_q, ref_scales = mxfp8_e4m3_quantize(full, min_amax=1e-4)
++        id_changes = int((ids != ref_ids).sum().item())
++        weight_changes = int((weights.view(torch.int32) != ref_weights.contiguous().view(torch.int32)).sum().item())
++        quant_equal = _bits_equal(q_bytes, ref_q) and _bits_equal(scales, ref_scales)
++        reconstructed = _bits_equal(bf, mxfp8_quantize_dequantize(full, 1e-4))
++        idempotent = _bits_equal(bf, mxfp8_quantize_dequantize(bf, 1e-4))
++        del full_logits, ref_q, ref_scales
++        if diagnose:
++            ref_local_ids = ref_ids.narrow(0, rank * LOCAL_ROWS, LOCAL_ROWS)
++            ref_local_weights = ref_weights.narrow(0, rank * LOCAL_ROWS, LOCAL_ROWS).view(torch.int32)
++            for gate_rows in (2048, 4096):
++                probe_weights, probe_ids = _route(runner, x, local_ids, rank, gate_rows)
++                logger.info(
++                    "ADA_FFN_GATE_SHAPE_TRACE rows=%d rank=%d layer=%s ids=%d weights=%d",
++                    gate_rows, rank, runner.layer_name,
++                    int((probe_ids != ref_local_ids).count_nonzero().item()),
++                    int((probe_weights.view(torch.int32) != ref_local_weights).count_nonzero().item()),
++                )
++        else:
++            del full, ref_weights, ref_ids
++
++    activation = QuantizedActivation(
++        q_bytes.view(torch.float8_e4m3fn), scales, x.dtype, bf.shape, kMxfp8Dynamic,
++    )
++    shared = shared_expert(activation)
++    routed = runner.routed_experts.forward_modular(x=bf, topk_weights=weights, topk_ids=ids)
++    assert isinstance(routed, torch.Tensor) and isinstance(shared, torch.Tensor)
++    if diagnose:
++        ref_shared = shared_expert(full)
++        shared_delta = _bf16_diff(shared, ref_shared)
++        del ref_shared
++        forward_routed = runner.routed_experts.forward_modular
++        ref_routed = forward_routed(x=full, topk_weights=ref_weights, topk_ids=ref_ids)
++        routed_delta = _bf16_diff(routed, ref_routed)
++        repeated_routed = forward_routed(x=full, topk_weights=ref_weights, topk_ids=ref_ids)
++        repeat_routed_delta = _bf16_diff(ref_routed, repeated_routed)
++        del ref_routed, repeated_routed
++
++    shared, routed = runner._maybe_apply_routed_scale_to_output(shared, routed)
++    result = runner._ada_prefill_reduce_scatter(shared + routed, None, False, check=False)
++    if audit:
++        exact_out = _bits_equal(result, original)
++        if diagnose:
++            del shared, routed, bf, activation, q_bytes, scales
++            repeated = ffn(full, token_ids, ada_prefill_reduce_scatter=2)
++            result_delta = _bf16_diff(result, original)
++            repeat_result_delta = _bf16_diff(repeated, original)
++            logger.info(
++                "ADA_FFN_NARROW_TRACE rank=%d layer=%s shared=%d/%.9g routed=%d/%.9g "
++                "routed_repeat=%d/%.9g out=%d/%.9g out_repeat=%d/%.9g",
++                rank, runner.layer_name, *shared_delta, *routed_delta,
++                *repeat_routed_delta, *result_delta, *repeat_result_delta,
++            )
++        logger.info(
++            "ADA_FFN_NARROW_AUDIT mode=%s rank=%d layer=%s ids=%d weights=%d quant=%d reconstruct=%d requant=%d output=%d",
++            mode, rank, runner.layer_name, id_changes, weight_changes, quant_equal,
++            reconstructed, idempotent, exact_out,
++        )
++        return original
++    logger.info_once("Ada FFN narrow gather executed mode=%s layer=%s", mode, runner.layer_name)
++    return result

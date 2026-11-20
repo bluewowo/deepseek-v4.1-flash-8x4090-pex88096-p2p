@@ -39,6 +39,25 @@ MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/models/DeepSeek-V4.1-Flash-1017}"
 : "${ENABLE_VISION:=1}"
 : "${MAX_IMAGES_PER_PROMPT:=2}"
 
+if [[ "${PEX88096_MODE16:-0}" == "1" ]]; then
+  if [[ "${PEX88096_PROFILE:-0}" != "1" ]]; then
+    echo 'Mode 16 requires the PEX88096 profile.' >&2
+    exit 1
+  fi
+  MAX_NUM_SEQS=8
+  state="${MODE16_STATE_DIR:-$PROJECT_DIR/profiles/mode16}"
+  for setting in mode ffn-mode scheduler-mode; do
+    if [[ ! -s "$state/$setting" ]]; then
+      echo "Missing mode 16 setting: $state/$setting" >&2
+      exit 1
+    fi
+  done
+  export DS1017_ADA_CED_SP_SWITCH="$state/mode"
+  export DS1017_ADA_FFN_GATHER_SWITCH="$state/ffn-mode"
+  export DS1017_MIXED_PREFILL_SWITCH="$state/scheduler-mode"
+  export DS1017_ADA_PACK_EXPERT_SCALES=0
+fi
+
 : "${NCCL_P2P_DISABLE:=1}"
 export CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE
 
@@ -68,8 +87,13 @@ args=(
 
 if [[ "${PEX88096_PROFILE:-0}" == "1" ]]; then
   overlay="$PROJECT_DIR/overlays/pex88096-vision14"
+  setup_args=
+  if [[ "${PEX88096_MODE16:-0}" == "1" ]]; then
+    overlay+="-mode16"
+    setup_args=' --mode16'
+  fi
   if [[ ! -x "$VIRTUAL_ENV/bin/vllm" || ! -s "$overlay/vllm/__init__.py" ]]; then
-    echo "Run ./setup_pex88096.sh before using the PEX88096 profile." >&2
+    echo "Run ./setup_pex88096.sh$setup_args before using this PEX88096 profile." >&2
     exit 1
   fi
   export PYTHONPATH="$overlay${PYTHONPATH:+:$PYTHONPATH}"

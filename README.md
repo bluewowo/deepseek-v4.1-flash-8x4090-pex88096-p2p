@@ -2,11 +2,27 @@
 
 双 PEX88096 单机部署 | PCIe P2P | SM89 | 1M 上下文
 
-在八张 48 GB RTX 4090 上，**512K 单流冷 prefill 实测 10,712 tok/s**，同一批请求的输出中位数为 **211.6 tok/s**。默认配置窗口为 **1,048,576 token**。历史近满窗测试在 **1,047,532 个输入 token** 下生成 384 个 token，并正确找回三处检索码。
+**档 16** 在八张 48 GB RTX 4090 上实现 **512K 单流冷 prefill 14,183 tok/s**，相对同实例档 15 提升 **4.23%**。档 16 提供 8 个活动序列和 **1,048,576 token** 的单请求配置窗口。公开安装器从固定 Vision14 wheel 构建这个独立 overlay。 [档 16 机制、使用与复测](docs/mode16.md)
 
-本项目提供能独立安装的 vLLM Vision14 部署档、双交换芯片的通信配置，以及预填充和解码的八卡 indexer 行分片。安装器校验运行时 wheel 和补丁，模型由固定快照与校验清单锁定。服务默认监听本机。 [完整部署手册](docs/pex88096.md) · [六条单流原始记录](results/pex88096-cold.jsonl)
+## 档 16
 
-## 实测
+| 改动 | 实测 |
+| --- | --- |
+| MXFP8 FFN 输入窄包 | 每 rank 的 AllGather 从 10 MiB 降至 5.203 MiB，32K / 128K / 512K 冷 prefill 分别提升 3.71% / 4.43% / 4.23% |
+| `burst8late` 长短请求调度 | 独立 C8 对照中，短流输出片间隔 p95 从 978–985 ms 降至 556–562 ms，512K 长流 TTFT 从 59.82–60.42 s 降至 47.68–48.03 s |
+| 联合验收 | 一个约 256K 长流和七个短流均完成，零前缀缓存命中 |
+
+档 16 以档 15 的序列并行、紧凑 CED、rank-major Engram 和 FFN ReduceScatter 为底座。两项增幅分别来自单变量配对。窄包路由和激活在逐层样本上逐位一致，Marlin 最终输出仍有少量 BF16 位差。 [脱敏单流数据](results/mode16-prefill.jsonl) · [脱敏调度数据](results/mode16-scheduler.jsonl)
+
+完成基础配置和模型下载后，手动启动档 16。服务默认监听本机。
+
+```bash
+./setup_pex88096.sh --mode16
+DRY_RUN=1 ./launch_pex88096_mode16.sh
+./launch_pex88096_mode16.sh
+```
+
+## 基础 PEX88096 配方实测
 
 | 输入约 | 冷 prefill（tok/s） | 首 token 延迟（s） | Decode（ms/验证轮） | 输出（tok/s） |
 | --- | ---: | ---: | ---: | ---: |
@@ -18,7 +34,7 @@
 
 近满窗历史样本采用同一 prefill 分片方案，引擎冷 prefill 为 112.44 秒，约 9,317 tok/s。该样本用的是当时的 decode 路径。上述速度都来自原版 FlashInfer Vision4。公开安装器默认使用可下载的 Vision4 post1，已验证依赖安装、补丁摘要、导入和启动 dry-run。 [测试方法与版本说明](docs/pex88096.md#单流实测)
 
-## 生产配置
+## 基础配方设置
 
 | 项目 | 默认值 |
 | --- | --- |
@@ -43,7 +59,7 @@
 
 安装器在独立 vLLM overlay 上应用三份补丁并校验源码摘要。可以从同一源码和依赖复建，也便于追踪 wheel 变更。 [生产补丁](patches/pex88096/) · [运行时依赖](profiles/pex88096-constraints.txt)
 
-## 安装和手动启动
+## 基础配方安装
 
 参考环境为 Linux x86-64、CUDA Toolkit 13.0、Python 3.12、uv 和可用的 4090 PCIe P2P 驱动。参考主机使用 NVIDIA 595.71.05，配有 2 TiB RAM。Engram 的两张表在 TP8 下合计约用 189 GiB 主机 pinned memory。模型、Python 依赖和编译缓存都需要本地存储空间。 [硬件与驱动版本](docs/pex88096.md#硬件与版本)
 
@@ -77,8 +93,8 @@ ENV_FILE="$PWD/.env.pex88096" ./tools/smoke-test.sh
 
 ## 项目来源
 
-本项目 fork 自 [ykk648/deepseek-v4.1-flash-8x4090](https://github.com/ykk648/deepseek-v4.1-flash-8x4090)。通过 [vLLM SM89 fork](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89) 运行 1017，解码索引行分片参考 [Spark 的实现](https://github.com/christopherowen/spark-ds41f/blob/spark-ds41f-1107/patches/vllm/0025-deepseek-v41-indexer-sp-split.patch)。部署封装使用 [MIT](LICENSE)，vLLM 补丁保留 [Apache-2.0](patches/pex88096/licenses/vllm-LICENSE)。
+本项目 fork 自 ykk648 的八卡部署。1017 运行时来自 vLLM SM89 fork。解码索引行分片、序列并行和窄包设计参考 Spark 的相应实验，`burst8late` 按本机 8192 行快路径设计。 [上游部署](https://github.com/ykk648/deepseek-v4.1-flash-8x4090) · [vLLM SM89](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89) · [Spark 索引分片](https://github.com/christopherowen/spark-ds41f/blob/8e5ea208f3d22bc69df91ace94d6975932c858a8/patches/vllm/0025-deepseek-v41-indexer-sp-split.patch) · [档 16 机制及引用](docs/mode16.md) · [MIT](LICENSE) · [vLLM Apache-2.0](patches/pex88096/licenses/vllm-LICENSE)
 
 ## English summary
 
-Single-node DeepSeek V4.1 Flash 1017 serving on eight 48 GB RTX 4090s connected through two PEX88096 switches. The profile configures PCIe P2P, shards prefill and decode indexer rows across eight GPUs, and adds an Ada prefill GEMM tile. At 512K, the cold single-stream benchmark measured 10,712 prefill tok/s and 211.6 output tok/s. See the [deployment guide](docs/pex88096.md) for prerequisites, the exact runtime and benchmark methodology.
+Single-node DeepSeek V4.1 Flash 1017 on eight 48 GB RTX 4090s and dual PEX88096. Opt-in Mode 16 adds sequence-parallel prefill, compact CED, MXFP8 FFN input packets, and mixed-length scheduling. Two paired cold runs at 512K measured 14,183 prefill tok/s, up 4.23% over Mode 15. The earlier 211.6 decode tok/s result belongs to the baseline profile. [Deployment guide](docs/pex88096.md) · [Mode 16 details](docs/mode16.md)

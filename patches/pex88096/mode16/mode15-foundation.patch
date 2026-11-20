@@ -1,0 +1,1137 @@
+--- a/vllm/model_executor/kernels/mhc/deepseek_v41.py
++++ b/vllm/model_executor/kernels/mhc/deepseek_v41.py
+@@ -80,6 +80,8 @@
+     x: torch.Tensor | None = None,
+     norm_weight: torch.Tensor | None = None,
+     norm_eps: float = 1e-6,
++    *,
++    projection_rows: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Generate next coefficients while collapsing with the previous pre-mix."""
+     from .deepseek_v41_tilelang import (
+@@ -173,8 +175,12 @@
+     )
+     if not tokens:
+         return outputs
+-    use_gemv = tokens <= 32
+-    splits = 1 if use_gemv else 16 if tokens <= 128 else 4 if tokens <= 1024 else 1
++    # Row sharding should preserve the full batch's K reduction order.
++    config_rows = tokens if projection_rows is None else projection_rows
++    use_gemv = config_rows <= 32
++    splits = (
++        1 if use_gemv else 16 if config_rows <= 128 else 4 if config_rows <= 1024 else 1
++    )
+     ada_split_gemv = (
+         use_gemv
+         and width == 20480
+@@ -247,6 +253,8 @@
+     pre_mix: torch.Tensor | None = None,
+     norm_weight: torch.Tensor | None = None,
+     norm_eps: float = 1e-6,
++    *,
++    projection_rows: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Fuse small batches; retain the native TF32x3 projection above 32 tokens."""
+     from .tilelang import mhc_fused_post_pre_delayed_tilelang, mhc_post_tilelang
+@@ -261,7 +269,8 @@
+         hc_post_mult_value,
+         sinkhorn_repeat,
+     )
+-    if 0 < x.shape[0] <= 32:
++    config_rows = x.shape[0] if projection_rows is None else projection_rows
++    if 0 < config_rows <= 32:
+         return mhc_fused_post_pre_delayed_tilelang(
+             x,
+             residual,
+@@ -276,7 +285,8 @@
+     return (
+         residual,
+         *mhc_pre_delayed_tilelang(
+-            residual, *args, pre_mix=pre_mix, norm_weight=norm_weight, norm_eps=norm_eps
++            residual, *args, pre_mix=pre_mix, norm_weight=norm_weight,
++            norm_eps=norm_eps, projection_rows=projection_rows,
+         ),
+     )
+ 
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -12,7 +12,10 @@
+ from vllm.distributed import (
+     get_ep_group,
+     get_pcp_group,
++    get_tp_group,
++    tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.distributed.eplb.eplb_state import EplbLayerState
+ from vllm.forward_context import (
+@@ -520,6 +523,54 @@
+ 
+         return states[..., :trunc_size] if trunc_size is not None else states
+ 
++    def _ada_prefill_reduce_scatter(
++        self,
++        states: torch.Tensor,
++        trunc_size: int | None,
++        output_is_reduced: bool,
++        check: bool,
++    ) -> torch.Tensor:
++        tp = get_tp_group()
++        assert tp.world_size == self.moe_config.ep_size == 8
++        assert self.moe_config.dp_size == self.moe_config.pcp_size == 1
++        assert not self.moe_config.is_sequence_parallel
++        assert not self.moe_config.skip_final_all_reduce and not output_is_reduced
++        assert self.routed_output_transform is None
++        assert not isinstance(self.router, ZeroExpertRouter)
++        assert states.shape == (8192, 5120) and states.dtype == torch.bfloat16
++
++        sharded = tensor_model_parallel_reduce_scatter(states.contiguous(), dim=0)
++        sharded = sharded[..., :trunc_size]
++        if not check:
++            logger.info_once("Ada FFN ReduceScatter executed %s", self.layer_name)
++            return sharded
++
++        reference = self._maybe_reduce_final_output(states, trunc_size, output_is_reduced)
++        rows = sharded.shape[0]
++        expected = reference.narrow(0, rows * tp.rank_in_group, rows)
++        expected = expected.contiguous()
++        actual = sharded.contiguous()
++        expected_float = expected.float()
++        delta = actual.float() - expected_float
++        # Each rank has at most 5,242,880 elements, representable exactly in FP32.
++        stats = torch.stack(
++            (
++                (actual.view(torch.int16) != expected.view(torch.int16)).count_nonzero().float(),
++                delta.square().sum(),
++                expected_float.square().sum(),
++                delta.abs().amax(),
++            )
++        )
++        ranks = tensor_model_parallel_all_gather(stats).view(tp.world_size, -1)
++        count, sum_square, norm_square = ranks[:, :3].double().sum(dim=0).tolist()
++        rel_rms = (sum_square / norm_square) ** 0.5 if norm_square else 0.0
++        logger.info_once(
++            "Ada FFN ReduceScatter check %s mismatches=%d/%d relative_rms=%.8g max_abs=%.8g",
++            self.layer_name, int(count), actual.numel() * tp.world_size, rel_rms,
++            ranks[:, 3].amax().item(),
++        )
++        return expected
++
+     def _encode_layer_name(self) -> str | LayerName:
+         if _USE_LAYERNAME:
+             return LayerName(self.layer_name)
+@@ -696,6 +747,8 @@
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+         shared_experts_input: torch.Tensor | None = None,
++        *,
++        ada_prefill_reduce_scatter: int = 0,
+     ) -> torch.Tensor:
+         """Invoke the fused moe layer.
+ 
+@@ -794,6 +847,12 @@
+             result = shared_output + fused_output
+         else:
+             result = fused_output
++
++        if ada_prefill_reduce_scatter:
++            return self._ada_prefill_reduce_scatter(
++                result, og_hidden_dim_post_xform, fused_output_is_reduced,
++                check=ada_prefill_reduce_scatter == 1,
++            )
+ 
+         result = self._maybe_reduce_final_output(
+             result, og_hidden_dim_post_xform, fused_output_is_reduced
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -616,14 +616,16 @@
+             loaded_weight = loaded_weight.reshape(1)
+         param.load_column_parallel_weight(loaded_weight=loaded_weight)
+ 
++    def forward_local(self, input_) -> torch.Tensor:
++        """Project to the columns owned by this TP rank."""
++        bias = self.bias if not self.skip_bias_add else None
++        return self.quant_method.apply(self, input_, bias)
++
+     def forward(
+         self,
+         input_,
+     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+-        bias = self.bias if not self.skip_bias_add else None
+-
+-        # Matrix multiply.
+-        output_parallel = self.quant_method.apply(self, input_, bias)
++        output_parallel = self.forward_local(input_)
+ 
+         if self.gather_output and self.tp_size > 1:
+             # All-gather across the partitions.
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -455,6 +455,8 @@
+         hidden_states: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+         mega_gate_metadata: MegaGateRoutingMetadata | None = None,
++        *,
++        ada_prefill_reduce_scatter: int = 0,
+     ) -> torch.Tensor:
+         if self.gate.tid2eid is not None and input_ids is None:
+             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+@@ -464,7 +466,12 @@
+             raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
+ 
+         if not self.use_native_mega_moe:
++            if ada_prefill_reduce_scatter:
++                return self._forward_fused_moe(
++                    hidden_states, input_ids, ada_prefill_reduce_scatter
++                )
+             return self._forward_fused_moe(hidden_states, input_ids)
++        assert not ada_prefill_reduce_scatter
+ 
+         org_shape = hidden_states.shape
+         # Small local padded batches favor GateLinear; 128-expert gates cross earlier.
+@@ -526,15 +533,26 @@
+         return final_hidden_states.view(org_shape)
+ 
+     def _forward_fused_moe(
+-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++        ada_prefill_reduce_scatter: int = 0,
+     ) -> torch.Tensor:
+         org_shape = hidden_states.shape
++        options = (
++            {"ada_prefill_reduce_scatter": ada_prefill_reduce_scatter}
++            if ada_prefill_reduce_scatter
++            else {}
++        )
+         final_hidden_states = self.experts(
+             hidden_states=hidden_states,
+             router_logits=hidden_states,
+             input_ids=input_ids,
+-        )
+-
++            **options,
++        )
++
++        if ada_prefill_reduce_scatter:
++            return final_hidden_states
+         return final_hidden_states.view(org_shape)
+ 
+ 
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -38,7 +38,9 @@
+     get_engram_dp_size,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    get_tp_group,
+     tensor_model_parallel_all_gather,
++    tensor_model_parallel_all_reduce,
+ )
+ from vllm.distributed.device_communicators.shm_broadcast import (
+     SHM_PATH,
+@@ -1213,6 +1215,7 @@
+     hidden_stride_t,
+     hidden_stride_h,
+     hidden_stride_d,
++    kv_stride_rank,
+     kv_stride_t,
+     kv_stride_d,
+     q_stride_h,
+@@ -1229,6 +1232,7 @@
+     HC_MULT: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+     HAS_MASK: tl.constexpr,
++    KV_RANK_COLS: tl.constexpr,
+ ):
+     program_idx = tl.program_id(0)
+     token_idx = program_idx // HC_MULT
+@@ -1247,8 +1251,23 @@
+         mask=dim_valid,
+         other=0.0,
+     ).to(tl.float32)
++    key_cols = hc_idx * DIM + dim_offsets
++    value_cols = HC_MULT * DIM + dim_offsets
++    if KV_RANK_COLS:
++        key_offsets = (
++            (key_cols // KV_RANK_COLS) * kv_stride_rank
++            + (key_cols % KV_RANK_COLS) * kv_stride_d
++        )
++        value_offsets = (
++            (value_cols // KV_RANK_COLS) * kv_stride_rank
++            + (value_cols % KV_RANK_COLS) * kv_stride_d
++        )
++    else:
++        key_offsets = key_cols * kv_stride_d
++        value_offsets = value_cols * kv_stride_d
++    kv_row = kv + source_idx * kv_stride_t
+     key = tl.load(
+-        kv + source_idx * kv_stride_t + (hc_idx * DIM + dim_offsets) * kv_stride_d,
++        kv_row + key_offsets,
+         mask=source_valid & dim_valid,
+         other=0.0,
+     ).to(tl.float32)
+@@ -1279,7 +1298,7 @@
+         gate = tl.where(active, gate, 0.0)
+ 
+     value = tl.load(
+-        kv + source_idx * kv_stride_t + (HC_MULT * DIM + dim_offsets) * kv_stride_d,
++        kv_row + value_offsets,
+         mask=source_valid & dim_valid,
+         other=0.0,
+     ).to(tl.float32)
+@@ -1702,16 +1721,27 @@
+         hidden_states: torch.Tensor,
+         hash_ids: torch.Tensor,
+         token_mask: torch.Tensor | None = None,
++        *,
++        ada_rows: bool = False,
++        ada_check_rows: bool = False,
++        ada_rank_major: int = 0,
+     ) -> torch.Tensor:
+         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
+         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
+         the gate so those positions pass through untouched."""
+         if self._batch is not None:
+-            kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
++            wkv_input = self._batch.wkv_input(self, hash_ids.shape[0])
+         else:
+-            kv = self.wkv(self.embed(hash_ids).flatten(-2))
++            wkv_input = self.embed(hash_ids).flatten(-2)
+         num_kv_tokens = hash_ids.shape[0]
+         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
++        if ada_rows:
++            return self._forward_ada_rows(
++                hidden_states, self.wkv.forward_local(wkv_input), token_mask,
++                ada_check_rows, ada_rank_major,
++            )
++
++        kv = self.wkv(wkv_input)
+         if self.use_sequence_parallel:
+             tp_size = get_tensor_model_parallel_world_size()
+             tp_rank = get_tensor_model_parallel_rank()
+@@ -1723,6 +1753,69 @@
+                 token_mask = token_mask[start : start + num_kv_tokens]
+ 
+         return self._post_wkv(hidden_states, kv, token_mask, num_kv_tokens)
++
++    def _forward_ada_rows(
++        self,
++        hidden_states: torch.Tensor,
++        columns: torch.Tensor,
++        token_mask: torch.Tensor | None,
++        check: bool,
++        rank_major_mode: int,
++    ) -> torch.Tensor:
++        """Exchange WKV TP columns for complete WKV rows on their owners."""
++        tp = get_tp_group()
++        communicator = tp.device_communicator.pynccl_comm
++        assert communicator is not None and communicator.available and not communicator.disabled
++        assert tp.world_size == self.wkv.tp_size == 8
++        assert self.wkv.gather_output and not self.use_sequence_parallel
++        num_rows, num_cols = columns.shape
++        local_rows = hidden_states.shape[0]
++        assert num_rows == local_rows * tp.world_size == 8192
++        start = tp.rank_in_group * local_rows
++        row_slice = slice(start, start + local_rows)
++        local_mask = token_mask[row_slice] if token_mask is not None else None
++        splits = [local_rows] * tp.world_size
++        recv = torch.empty_like(columns, memory_format=torch.contiguous_format)
++        communicator.all_to_all_single(recv, columns.contiguous(), splits, splits)
++        rank_major = recv.view(tp.world_size, local_rows, num_cols)
++        if rank_major_mode == 2 and getattr(self, "_ada_rank_major_exact", False):
++            logger.info_once("Ada Engram rank-major executed hash_index=%d", self.layer_hash_index)
++            return self._post_wkv(hidden_states, rank_major, local_mask, local_rows)
++
++        local_kv = rank_major.transpose(0, 1).contiguous().view(local_rows, -1)
++        local_output = self._post_wkv(hidden_states, local_kv, local_mask, local_rows)
++        if rank_major_mode == 1:
++            direct = self._post_wkv(hidden_states, rank_major, local_mask, local_rows)
++            exact = torch.equal(direct.view(torch.uint8), local_output.view(torch.uint8))
++            good_ranks = tensor_model_parallel_all_reduce(
++                torch.tensor(int(exact), dtype=torch.int32, device=columns.device)
++            ).item()
++            self._ada_rank_major_exact = (
++                getattr(self, "_ada_rank_major_exact", True) and good_ranks == tp.world_size
++            )
++            logger.info_once(
++                "Ada Engram rank-major check hash_index=%d gate_ranks=%d",
++                self.layer_hash_index, good_ranks,
++            )
++            return local_output
++        if not check:
++            logger.info_once("Ada Engram row exchange executed hash_index=%d", self.layer_hash_index)
++            return local_output
++
++        full_kv = tensor_model_parallel_all_gather(columns)
++        full_hidden = tensor_model_parallel_all_gather(hidden_states, dim=0)
++        expected = self._post_wkv(full_hidden, full_kv, token_mask, num_rows)[row_slice]
++        exact_kv = torch.equal(local_kv.view(torch.uint8), full_kv[row_slice].view(torch.uint8))
++        exact_output = torch.equal(local_output.view(torch.uint8), expected.view(torch.uint8))
++        kv_count, output_count = tensor_model_parallel_all_reduce(
++            torch.tensor([exact_kv, exact_output], dtype=torch.int32, device=columns.device)
++        ).tolist()
++        self._ada_rows_exact = kv_count == output_count == tp.world_size
++        logger.info_once(
++            "Ada Engram row exchange check hash_index=%d wkv_ranks=%d gate_ranks=%d",
++            self.layer_hash_index, kv_count, output_count,
++        )
++        return expected
+ 
+     def _post_wkv(
+         self,
+@@ -1734,7 +1827,14 @@
+         """The gated update from the `wkv` output of `num_kv_tokens` tokens."""
+         num_tokens, hc_mult, dim = hidden_states.shape
+         assert hc_mult == self.hc_mult and dim == self.dim
+-        assert kv.ndim == 2 and kv.shape[1] == (hc_mult + 1) * dim
++        if kv.ndim == 3:
++            ranks, rows, rank_cols = kv.shape
++            assert kv.is_contiguous() and rows == num_kv_tokens
++            assert ranks * rank_cols == (hc_mult + 1) * dim
++            kv_rank_stride = kv.stride(0)
++        else:
++            assert kv.ndim == 2 and kv.shape[1] == (hc_mult + 1) * dim
++            rank_cols = kv_rank_stride = 0
+         output = torch.empty_like(hidden_states)
+         if num_tokens == 0:
+             return output
+@@ -1753,8 +1853,9 @@
+             hidden_states.stride(0),
+             hidden_states.stride(1),
+             hidden_states.stride(2),
+-            kv.stride(0),
+-            kv.stride(1),
++            kv_rank_stride,
++            kv.stride(-2),
++            kv.stride(-1),
+             self.q_weight.stride(0),
+             self.q_weight.stride(1),
+             self.k_weight.stride(0),
+@@ -1769,6 +1870,7 @@
+             HC_MULT=hc_mult,
+             BLOCK_SIZE=block_size,
+             HAS_MASK=token_mask is not None,
++            KV_RANK_COLS=rank_cols,
+             num_warps=num_warps,
+         )
+         return output
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -197,7 +197,9 @@
+         raise NotImplementedError
+ 
+     @abstractmethod
+-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
++    def _o_proj(
++        self, o: torch.Tensor, positions: torch.Tensor, *, ada_local_wo: bool = False,
++    ) -> torch.Tensor:
+         """Inverse-RoPE + wo_a + wo_b output projection (platform-specific)."""
+         raise NotImplementedError
+ 
+@@ -554,9 +556,13 @@
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
++        *,
++        ada_local_wo: bool = False,
++        ada_sp_front: bool = False,
++        ada_check_front: bool = False,
+     ) -> torch.Tensor:
+         # Allocate at the backend head count and slice if a backend pads heads.
+-        num_tokens = hidden_states.shape[0]
++        num_tokens = positions.shape[0] if ada_sp_front else hidden_states.shape[0]
+         o_padded = torch.empty(
+             (num_tokens, self.padded_heads, self.head_dim),
+             dtype=hidden_states.dtype,
+@@ -565,9 +571,14 @@
+ 
+         # Keep the attention input preparation in the captured graph. Only the
+         # sparse indexer and MLA attention run in the eager break below.
+-        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+-            hidden_states
+-        )
++        if ada_sp_front:
++            hidden_states, qr_kv, kv_score, indexer_weights = (
++                self._run_ada_sp_input_projections(hidden_states, ada_check_front)
++            )
++        else:
++            qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
++                hidden_states
++            )
+         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+ 
+         self._prepare_and_attn_fn(
+@@ -583,7 +594,52 @@
+         o = o_padded[:, : self.n_local_heads, :]
+ 
+         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
++        if ada_local_wo:
++            return self._o_proj(o, positions, ada_local_wo=True)
+         return self._o_proj(o, positions)
++
++    def _run_ada_sp_input_projections(
++        self, local_hidden: torch.Tensor, check: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
++        from vllm.models.common.ops.sequence_parallel import sp_all_gather
++
++        eligible = self.compressor is None
++        if not eligible or (not check and not getattr(self, "_ada_sp_front_exact", False)):
++            hidden = sp_all_gather(local_hidden)
++            return hidden, *self._run_parallel_input_projections(hidden)
++
++        qr_kv, _, index_weights = self._run_parallel_input_projections(local_hidden)
++        qr_kv = sp_all_gather(qr_kv.contiguous())
++        if index_weights is not None:
++            index_weights = sp_all_gather(index_weights.contiguous())
++        if check:
++            hidden = sp_all_gather(local_hidden)
++            reference = self._run_parallel_input_projections(hidden)
++            # Compare byte views so signed zero and padding cannot hide a mismatch.
++            main_exact = torch.equal(qr_kv.view(torch.uint8), reference[0].view(torch.uint8))
++            weight_exact = index_weights is None and reference[2] is None
++            if index_weights is not None and reference[2] is not None:
++                weight_exact = torch.equal(
++                    index_weights.view(torch.uint8), reference[2].contiguous().view(torch.uint8)
++                )
++            self._ada_sp_front_exact = (
++                getattr(self, "_ada_sp_front_exact", True) and main_exact and weight_exact
++            )
++            # All ranks validate independently. Only the all-rank result can
++            # decide which collective path is taken on later forwards.
++            from vllm.distributed import tensor_model_parallel_all_reduce
++
++            good = local_hidden.new_tensor(int(self._ada_sp_front_exact), dtype=torch.int32)
++            self._ada_sp_front_exact = int(tensor_model_parallel_all_reduce(good)) == 8
++            logger.info_once(
++                "Ada SP narrow front check %s qkv=%s index_weights=%s all_ranks=%s",
++                self.prefix, main_exact, weight_exact, self._ada_sp_front_exact,
++            )
++            return hidden, *reference
++        logger.info_once("Ada SP narrow front executed for %s", self.prefix)
++        # The native V4.1 indexer only reads the row count and device from
++        # this argument. Q values and index weights are separate tensors.
++        return qr_kv, qr_kv, None, index_weights
+ 
+     @cached_property
+     def _can_fuse_query_quant(self) -> bool:
+@@ -784,14 +840,17 @@
+         self, hidden_states: torch.Tensor, positions: torch.Tensor
+     ) -> None:
+         """Publish full encoder context without decoder Q, SWA, or index queries."""
++        self.insert_ced_global_kv(self.project_ced_global_kv(hidden_states), positions)
++
++    def project_ced_global_kv(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        compressor = self.compressor
++        assert compressor is not None
++        return torch.mm(hidden_states, compressor.fused_wkv_wgate.weight.T, out_dtype=torch.float32)
++
++    def insert_ced_global_kv(self, kv_score: torch.Tensor, positions: torch.Tensor) -> None:
+         compressor = self.compressor
+         if compressor is None or self.indexer is None or not self.indexer.owns_k:
+             raise ValueError("CED global-KV preparation requires a KV-source layer")
+-        kv_score = torch.mm(
+-            hidden_states,
+-            compressor.fused_wkv_wgate.weight.T,
+-            out_dtype=torch.float32,
+-        )
+         latent = compressor(kv_score, positions)
+         self.indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+         compressor.insert_cache(latent, positions, self.rotary_emb)
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/nvidia/ada_wo_exchange.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Experimental TP8 prefill output projection for the SM89 1017 overlay."""
++
++import os
++from pathlib import Path
++
++import torch
++
++from vllm.distributed import get_tp_group
++from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
++from vllm.model_executor.kernels.linear.mxfp8.ada import (
++    AdaMxfp8LinearKernel,
++    _ada_mxfp8_k32_linear_kernel,
++)
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++ROWS = 8192
++WORLD = 8
++LOCAL = ROWS // WORLD
++INPUTS = 1024
++HIDDEN = 5120
++SCALES = INPUTS // 32
++VALUE_BYTES = LOCAL * INPUTS
++SPLITS = [1] * WORLD
++logger = init_logger(__name__)
++
++
++@triton.jit
++def _sum_parts(parts, out, size: tl.constexpr):
++    elements = tl.program_id(0) * 512 + tl.arange(0, 512)
++    ranks = tl.arange(0, 8)
++    values = tl.load(parts + ranks[:, None] * size + elements[None, :]).to(tl.float32)
++    tl.store(out + elements, tl.sum(values, axis=0))
++
++
++class _Workspace:
++    def __init__(self, comm, device, switch_file):
++        self.comm = comm
++        self.switch_file = switch_file
++        self.send = torch.empty(
++            (WORLD, VALUE_BYTES + LOCAL * SCALES), dtype=torch.uint8, device=device,
++        )
++        self.recv = torch.empty_like(self.send)
++        self.parts = torch.empty((WORLD, LOCAL, HIDDEN), dtype=torch.bfloat16, device=device)
++        self.local_result = torch.empty_like(self.parts[0])
++
++    def project(self, layer, z, *, local_only=False):
++        q, scales, _, _ = AdaMxfp8LinearKernel._quantize_input(z, INPUTS)
++        self.send[:, :VALUE_BYTES].copy_(q.view(torch.uint8).view(WORLD, -1))
++        self.send[:, VALUE_BYTES:].copy_(scales.view(WORLD, -1))
++        self.comm.all_to_all_single(self.recv, self.send, SPLITS, SPLITS)
++        for peer in range(WORLD):
++            data = self.send if peer == self.comm.rank else self.recv
++            x = data[peer, :VALUE_BYTES].view(torch.float8_e4m3fn).view(LOCAL, INPUTS)
++            scale = data[peer, VALUE_BYTES:].view(LOCAL, SCALES)
++            weight, weight_scale = layer._ada_wo_exchange_weights[peer]
++            out = self.parts[peer]
++            _ada_mxfp8_k32_linear_kernel[(640, 1)](
++                x, weight, scale, weight_scale, out, out, LOCAL,
++                N=HIDDEN, K=INPUTS, HAS_BIAS=False, SPLIT_K=1,
++                BLOCK_M=128, BLOCK_N=64, num_warps=4,
++            )
++        _sum_parts[(LOCAL * HIDDEN // 512,)](
++            self.parts, self.local_result, LOCAL * HIDDEN,
++        )
++        if local_only:
++            return self.local_result
++        result = z.new_empty((ROWS, HIDDEN))
++        self.comm.all_gather(result, self.local_result)
++        return result
++
++
++def bind_ada_wo_exchange(layers, limit, *, skip_engram=False):
++    """Replicate the configured weights and allocate measured persistent buffers."""
++    if not 1 <= limit <= len(layers):
++        raise ValueError("Invalid number of encoder layers for Ada WO exchange")
++    group = get_tp_group()
++    comm = getattr(group.device_communicator, "pynccl_comm", None)
++    if group.world_size != WORLD or comm is None or not comm.available or comm.disabled:
++        raise RuntimeError("Ada WO exchange requires the TP8 PyNCCL communicator")
++    switch = os.environ.get("DS1017_WO_EXCHANGE_SWITCH")
++    workspace = None
++    blocks = [block for block in layers[:limit] if not (skip_engram and block.engram is not None)]
++    for block in blocks:
++        attn = block.attn
++        wo = attn.wo_b
++        if (
++            block.use_sequence_parallel
++            or not wo.reduce_results or wo.bias is not None or wo.return_bias
++            or tuple(wo.weight.shape) != (INPUTS, HIDDEN)
++            or tuple(wo.weight_scale.shape) != (HIDDEN, SCALES)
++            or wo.weight.dtype != torch.float8_e4m3fn
++            or wo.weight_scale.dtype != torch.uint8
++            or torch.cuda.get_device_capability(wo.weight.device) != (8, 9)
++        ):
++            raise RuntimeError(f"Unsupported Ada WO topology or weights for {attn.prefix}")
++        w = wo.weight.new_empty((WORLD, INPUTS, HIDDEN))
++        s = wo.weight_scale.new_empty((WORLD, HIDDEN, SCALES))
++        comm.all_gather(w.view(torch.uint8), wo.weight.view(torch.uint8))
++        comm.all_gather(s, wo.weight_scale)
++        attn._ada_wo_exchange_weights = tuple(
++            (wo.weight, wo.weight_scale)
++            if peer == comm.rank else (w[peer].clone(), s[peer].clone())
++            for peer in range(WORLD)
++        )
++        if workspace is None:
++            workspace = _Workspace(comm, wo.weight.device, Path(switch) if switch else None)
++        attn._ada_wo_exchange = workspace
++    logger.info("Ada WO exchange bound for %d encoder layers, rows=%d", len(blocks), ROWS)
++
++
++def _exchange(z: torch.Tensor, prefix: str) -> torch.Tensor:
++    ctx = get_forward_context()
++    layer = ctx.no_compile_layers[prefix]
++    workspace = layer._ada_wo_exchange
++    metadata = ctx.attn_metadata
++    if not isinstance(metadata, dict):
++        return layer.wo_b(z)
++    swa = metadata.get(layer.swa_cache_layer.prefix)
++    if swa is None or swa.num_prefills == 0 or swa.num_decodes != 0:
++        return layer.wo_b(z)
++    if workspace.switch_file is not None:
++        # The lab runner changes this shared file atomically between requests.
++        if layer.layer_id >= int(workspace.switch_file.read_text()):
++            return layer.wo_b(z)
++    logger.info_once("Ada WO exchange executed for %s", prefix)
++    return workspace.project(layer, z)
++
++
++def _exchange_fake(z: torch.Tensor, prefix: str) -> torch.Tensor:
++    return z.new_empty((z.shape[0], HIDDEN))
++
++
++direct_register_custom_op(
++    op_name="dsv41_ada_wo_exchange", op_func=_exchange, fake_impl=_exchange_fake,
++)
+--- a/vllm/models/deepseek_v4_1/nvidia/ced.py
++++ b/vllm/models/deepseek_v4_1/nvidia/ced.py
+@@ -265,12 +265,20 @@
+         hidden: torch.Tensor,
+         pre_mix: torch.Tensor,
+         input_ids: torch.Tensor,
++        *,
++        compact_prefill: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         if plan.cache_window != self.window:
+             raise ValueError("CED plan and tail cache windows do not match")
+-        if hidden.shape != (plan.num_input_tokens, 4, self.hidden.shape[-1]):
++        if compact_prefill and (
++            not all(request.is_prefilling for request in plan.requests)
++            or not all(plan.use_cache)
++        ):
++            raise ValueError("Compact CED boundary supports prefill and cached replay only")
++        rows = len(plan.store_rows) if compact_prefill else plan.num_input_tokens
++        if hidden.shape != (rows, 4, self.hidden.shape[-1]):
+             raise ValueError("CED boundary residual shape does not match its plan")
+-        if pre_mix.shape != (plan.num_input_tokens, 4):
++        if pre_mix.shape != (rows, 4):
+             raise ValueError("CED requires carried per-stream pre-mix coefficients")
+         if hidden.dtype != torch.bfloat16 or pre_mix.dtype != torch.float32:
+             raise ValueError("CED preserves BF16 residuals and FP32 pre-mix")
+@@ -310,8 +318,12 @@
+ 
+         if plan.store_rows:
+             source, target = indices(plan.store_rows), indices(plan.store_slots)
+-            self.hidden.index_copy_(0, target, hidden.index_select(0, source))
+-            self.pre_mix.index_copy_(0, target, pre_mix.index_select(0, source))
++            self.hidden.index_copy_(
++                0, target, hidden if compact_prefill else hidden.index_select(0, source)
++            )
++            self.pre_mix.index_copy_(
++                0, target, pre_mix if compact_prefill else pre_mix.index_select(0, source)
++            )
+             self.input_ids.index_copy_(0, target, input_ids[source].to(torch.int64))
+         for request, replay_start in zip(
+             plan.requests, plan.request_replay_starts, strict=True
+@@ -322,7 +334,10 @@
+                     self.valid_starts[request.slot],
+                     self.ends[request.slot] - (request.prefill_len - replay_start),
+                 )
+-        cached, current = indices(plan.cache_rows), indices(plan.current_rows)
++        cached = indices(plan.cache_rows)
++        if compact_prefill:
++            return self.hidden[cached], self.pre_mix[cached], self.input_ids[cached]
++        current = indices(plan.current_rows)
+         mask = torch.tensor(plan.use_cache, dtype=torch.bool, device=device)
+         return (
+             torch.where(mask[:, None, None], self.hidden[cached], hidden[current]),
+--- a/vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v4_1/nvidia/flashinfer_sparse.py
+@@ -314,14 +314,19 @@
+             )
+         return num_heads
+ 
+-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
++    def _o_proj(
++        self, o: torch.Tensor, positions: torch.Tensor, *, ada_local_wo: bool = False,
++    ) -> torch.Tensor:
+         del positions
+         # The native final store applies inverse RoPE and writes [G, T, D].
+         group_dim = o.shape[1] * o.shape[2] // self.n_local_groups
+         grouped_o = o.view(self.n_local_groups, o.shape[0], group_dim).transpose(0, 1)
+         weight = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+         projected = torch.einsum("bhd,hrd->bhr", grouped_o, weight)
+-        return self.wo_b(projected.flatten(1))
++        z = projected.flatten(1)
++        if ada_local_wo:
++            return self._ada_wo_exchange.project(self, z, local_only=True)
++        return self.wo_b(z)
+ 
+     def _global_slots(
+         self,
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import typing
+ from collections.abc import Callable, Iterable
+ from itertools import islice
++from pathlib import Path
+ 
+ import regex as re
+ import torch
+@@ -13,7 +15,9 @@
+ from vllm.config.kernel import MEGA_MOE_BACKENDS
+ from vllm.distributed import (
+     get_pp_group,
++    get_tp_group,
+     get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_reduce,
+ )
+ from vllm.distributed.utils import get_pp_indices
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+@@ -310,10 +314,16 @@
+         residual: torch.Tensor | None = None,
+         engram_hashes: torch.Tensor | None = None,
+         engram_mask: torch.Tensor | None = None,
++        *,
++        ada_sp_mode: int = 0,
++        ada_ffn_reduce_scatter: int = 0,
++        ada_engram_rank_major: int = 0,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         # The reference collapses each sublayer's input with the *previous*
+         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
+         # for the first layer), the FFN uses this layer's attention pre-mix.
++        projection_rows = positions.shape[0] if ada_sp_mode else None
++        ada_engram_rows = ada_sp_mode in (9, 10) and self.engram is not None
+         if residual is None:
+             if x.dim() == 2:
+                 # First layer: the stream is the embedding broadcast to hc
+@@ -333,6 +343,7 @@
+                     x=x,
+                     norm_weight=self.attn_norm.weight,
+                     norm_eps=self.attn_norm.variance_epsilon,
++                    projection_rows=projection_rows,
+                 )
+             else:
+                 residual = x
+@@ -341,6 +352,9 @@
+                         residual,
+                         engram_hashes[:, self.engram.layer_hash_index],
+                         engram_mask,
++                        ada_rows=ada_engram_rows,
++                        ada_check_rows=ada_sp_mode == 10,
++                        ada_rank_major=ada_engram_rank_major,
+                     )
+                 post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                     residual,
+@@ -355,6 +369,7 @@
+                     pre_mix=pre_mix,
+                     norm_weight=self.attn_norm.weight,
+                     norm_eps=self.attn_norm.variance_epsilon,
++                    projection_rows=projection_rows,
+                 )
+         elif self.engram is None or engram_hashes is None:
+             residual, post_mix, res_mix, x, attn_pre = mhc_post_pre_delayed(
+@@ -373,6 +388,7 @@
+                 pre_mix=pre_mix,
+                 norm_weight=self.attn_norm.weight,
+                 norm_eps=self.attn_norm.variance_epsilon,
++                projection_rows=projection_rows,
+             )
+         else:
+             residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
+@@ -384,6 +400,9 @@
+                     residual,
+                     engram_hashes[:, self.engram.layer_hash_index],
+                     engram_mask,
++                    ada_rows=ada_engram_rows,
++                    ada_check_rows=ada_sp_mode == 10,
++                    ada_rank_major=ada_engram_rank_major,
+                 )
+             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
+                 residual,
+@@ -398,14 +417,29 @@
+                 pre_mix=pre_mix,
+                 norm_weight=self.attn_norm.weight,
+                 norm_eps=self.attn_norm.variance_epsilon,
+-            )
+-
+-        if self.use_sequence_parallel:
+-            x = sp_all_gather(x)[: positions.shape[0]]
+-
+-        x = self.attn(positions, x, None)
+-        if self.use_sequence_parallel:
+-            x = sp_reduce_scatter(x)
++                projection_rows=projection_rows,
++            )
++
++        if ada_engram_rows:
++            # Retain the checkpoint's attention projections and WO reduction
++            # at Engram layers. Only the collapsed stream needs a gather.
++            x = sp_shard(self.attn(positions, sp_all_gather(x), None))
++        elif ada_sp_mode:
++            local_wo = ada_sp_mode in (2, 3, 6, 7, 9, 10)
++            local_front = ada_sp_mode in (3, 4, 5, 6, 7, 9, 10)
++            x = self.attn(
++                positions, x if local_front else sp_all_gather(x),
++                ada_local_wo=local_wo, ada_sp_front=local_front,
++                ada_check_front=ada_sp_mode in (4, 7),
++            )
++            if not local_wo:
++                x = sp_shard(x)
++        else:
++            if self.use_sequence_parallel:
++                x = sp_all_gather(x)[: positions.shape[0]]
++            x = self.attn(positions, x, None)
++            if self.use_sequence_parallel:
++                x = sp_reduce_scatter(x)
+ 
+         residual, post_mix, res_mix, x, ffn_pre = mhc_post_pre_delayed(
+             x,
+@@ -423,8 +457,19 @@
+             pre_mix=attn_pre,
+             norm_weight=self.ffn_norm.weight,
+             norm_eps=self.ffn_norm.variance_epsilon,
+-        )
+-        x = self.ffn(x, input_ids)
++            projection_rows=projection_rows,
++        )
++        if ada_sp_mode:
++            full_ffn_input = sp_all_gather(x)
++            if ada_ffn_reduce_scatter:
++                x = self.ffn(
++                    full_ffn_input, input_ids,
++                    ada_prefill_reduce_scatter=ada_ffn_reduce_scatter,
++                )
++            else:
++                x = sp_shard(self.ffn(full_ffn_input, input_ids))
++        else:
++            x = self.ffn(x, input_ids)
+         return x, residual, post_mix, res_mix, ffn_pre
+ 
+ 
+@@ -877,14 +922,67 @@
+                 positions,
+                 replay_token_ids=intermediate_tensors["pp_token_ids"],
+             )
++        ada_sp_mode = ada_ffn_reduce_scatter = ada_engram_rank_major = 0
++        switch = getattr(self, "_ada_ced_sp_switch", None)
++        if (
++            switch is not None
++            and ced_step is not None
++            and full_num_tokens == ced_step.plan.num_input_tokens == 8192
++            and input_ids is not None
++            and len(ced_step.plan.requests) == 1
++            and ced_step.plan.requests[0].is_prefilling
++        ):
++            ada_sp_mode = int(switch.read_text())
++            if ada_sp_mode not in (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15):
++                raise ValueError(f"Unknown Ada CED sequence-parallel mode {ada_sp_mode}")
++            if ada_sp_mode:
++                logger.info_once("Ada CED encoder sequence parallel active (mode %d)", ada_sp_mode)
++            ada_ffn_reduce_scatter = {11: 1, 12: 2, 15: 2}.get(ada_sp_mode, 0)
++            ada_engram_rank_major = {13: 1, 14: 2, 15: 2}.get(ada_sp_mode, 0)
++            if ada_sp_mode >= 11:
++                ada_sp_mode = 9
++        ada_sp_active = False
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
++            if idx == 20 and ced_step is not None and ada_sp_active and ada_sp_mode in (6, 7, 9, 10):
++                assert pre_mix is not None
++                boundary = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
++                return self._forward_ced_decoder(
++                    ced_step, boundary, pre_mix, input_ids, positions,
++                    sp_boundary_mode=7 if ada_sp_mode == 7 else 6,
++                )
++            ada_engram_layer = (
++                layer.engram is not None and engram_hashes is not None
++                and (ada_sp_mode == 10 or (
++                    ada_sp_mode == 9 and getattr(layer.engram, "_ada_rows_exact", False)
++                ))
++            )
++            ada_sp_layer = bool(
++                ada_sp_mode and idx < 20 and (layer.engram is None or ada_engram_layer)
++            )
++            if ada_sp_active and not ada_sp_layer:
++                # Only rejoin the four residual streams at an Engram or CED
++                # boundary. The next layer consumes the reconstructed tensor.
++                hidden_states = sp_all_gather(
++                    mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
++                )
++                pre_mix = sp_all_gather(pre_mix)
++                residual, post_mix, res_mix = None, None, None
++            elif ada_sp_layer and not ada_sp_active:
++                hidden_states = sp_shard(hidden_states)
++                if residual is not None:
++                    residual = sp_shard(residual)
++                    post_mix = sp_shard(post_mix)
++                    res_mix = sp_shard(res_mix)
++                if pre_mix is not None:
++                    pre_mix = sp_shard(pre_mix)
++            ada_sp_active = ada_sp_layer
+             if idx == 20 and ced_step is not None:
+                 boundary = (
+                     hidden_states
+-                    if self.start_layer == 20
++                    if residual is None
+                     else mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+                 )
+                 assert pre_mix is not None
+@@ -901,6 +999,9 @@
+                 residual,
+                 engram_hashes,
+                 engram_mask,
++                ada_sp_mode=ada_sp_mode if ada_sp_layer else 0,
++                ada_ffn_reduce_scatter=ada_ffn_reduce_scatter if ada_sp_layer else 0,
++                ada_engram_rank_major=ada_engram_rank_major if ada_sp_layer else 0,
+             )
+             if idx + 1 in self.aux_hidden_state_layers:
+                 # Reconstruct the aux hidden state for draft models
+@@ -908,7 +1009,7 @@
+                     hidden_states, residual, post_mix, res_mix
+                 )
+                 aux_hidden_state = aux_recon.mean(dim=1)
+-                if self.use_sequence_parallel:
++                if self.use_sequence_parallel or ada_sp_layer:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                 aux_hidden_states.append(aux_hidden_state)
+                 final_aux_recon = aux_recon
+@@ -946,6 +1047,76 @@
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    @staticmethod
++    def _ced_boundary_norm(source, boundary, pre_mix, projection_rows=None):
++        _, _, normalized, _ = mhc_pre_delayed_tilelang(
++            boundary, source.hc_attn_fn, source.hc_attn_scale, source.hc_attn_base,
++            source.rms_norm_eps, source.hc_eps, source.hc_eps, source.hc_post_alpha,
++            source.hc_sinkhorn_iters, pre_mix=pre_mix,
++            norm_weight=source.attn_norm.weight, norm_eps=source.attn_norm.variance_epsilon,
++            projection_rows=projection_rows,
++        )
++        return normalized
++
++    def _prepare_ada_ced_shards(self, step, source, boundary, pre_mix, input_ids, positions, mode):
++        plan = step.plan
++        rows = plan.store_rows
++        local_rows = boundary.shape[0]
++        validated = getattr(self, "_ada_ced_boundary_validation", 0)
++        if (
++            len(plan.requests) != 1 or not plan.requests[0].is_prefilling or not rows
++            or not all(plan.use_cache)
++            or rows != tuple(range(rows[0], rows[-1] + 1))
++            or rows[0] // local_rows != rows[-1] // local_rows
++            or (mode == 6 and not validated)
++        ):
++            return None
++        tp = get_tp_group()
++        owner = rows[0] // local_rows
++        begin = rows[0] - owner * local_rows
++        if tp.rank_in_group == owner:
++            compact = boundary[begin:begin + len(rows)].clone()
++            carry = pre_mix[begin:begin + len(rows)].clone()
++        else:
++            compact = boundary.new_empty((len(rows), *boundary.shape[1:]))
++            carry = pre_mix.new_empty((len(rows), *pre_mix.shape[1:]))
++        tp.broadcast(compact, src=owner)
++        tp.broadcast(carry, src=owner)
++        local_norm = self._ced_boundary_norm(source, boundary, pre_mix, plan.num_input_tokens)
++        if mode == 7:
++            full_boundary = sp_all_gather(boundary)
++            full_carry = sp_all_gather(pre_mix)
++            norm = self._ced_boundary_norm(source, full_boundary, full_carry)
++            ref_projected = source.attn.project_ced_global_kv(norm)
++            local_projected = source.attn.project_ced_global_kv(local_norm)
++            projected = sp_all_gather(local_projected)
++            restored = slice(rows[0], rows[-1] + 1)
++            exact_tail = (
++                torch.equal(compact.view(torch.uint8), full_boundary[restored].view(torch.uint8))
++                and torch.equal(carry.view(torch.uint8), full_carry[restored].view(torch.uint8))
++            )
++            exact_norm = torch.equal(sp_all_gather(local_norm).view(torch.uint8), norm.view(torch.uint8))
++            exact_projected = torch.equal(projected.view(torch.uint8), ref_projected.view(torch.uint8))
++            flags = input_ids.new_tensor([int(exact_tail and exact_norm), int(exact_projected)])
++            globally_exact, projection_exact = tensor_model_parallel_all_reduce(flags).tolist()
++            choice = (2 if projection_exact == tp.world_size else 1) if globally_exact == tp.world_size else 0
++            self._ada_ced_boundary_validation = min(
++                getattr(self, "_ada_ced_boundary_validation", 2), choice
++            )
++            logger.info_once(
++                "Ada SP compact CED check tail=%s norm=%s projected=%s mode=%d",
++                exact_tail, exact_norm, exact_projected, self._ada_ced_boundary_validation,
++            )
++            source.attn.insert_ced_global_kv(ref_projected, positions)
++            return self.ced_tail.pack(plan, full_boundary, full_carry, input_ids)
++        if validated == 2:
++            projected = sp_all_gather(source.attn.project_ced_global_kv(local_norm))
++            source.attn.insert_ced_global_kv(projected, positions)
++        else:
++            source.attn.build_ced_global_kv(sp_all_gather(local_norm), positions)
++        logger.info_once("Ada SP compact CED executed mode=%d", validated)
++        return self.ced_tail.pack(plan, compact, carry, input_ids, compact_prefill=True)
++
+     def _forward_ced_decoder(
+         self,
+         step: CEDStep,
+@@ -954,6 +1125,8 @@
+         input_ids: torch.Tensor,
+         positions: torch.Tensor,
+         replay_token_ids: torch.Tensor | None = None,
++        *,
++        sp_boundary_mode: int = 0,
+     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+         """Full-context KV-only preparation followed by request-owned SWA replay."""
+         source = None
+@@ -961,26 +1134,20 @@
+         if self.start_layer <= 20:
+             assert self.ced_tail is not None
+             source = self.layers[20]
+-            _, _, normalized, _ = mhc_pre_delayed_tilelang(
+-                boundary,
+-                source.hc_attn_fn,
+-                source.hc_attn_scale,
+-                source.hc_attn_base,
+-                source.rms_norm_eps,
+-                source.hc_eps,
+-                source.hc_eps,
+-                source.hc_post_alpha,
+-                source.hc_sinkhorn_iters,
+-                pre_mix=pre_mix,
+-                norm_weight=source.attn_norm.weight,
+-                norm_eps=source.attn_norm.variance_epsilon,
+-            )
+-            source.attn.build_ced_global_kv(normalized, positions)
++            prepared = None
++            if sp_boundary_mode:
++                prepared = self._prepare_ada_ced_shards(
++                    step, source, boundary, pre_mix, input_ids, positions, sp_boundary_mode
++                )
++                if prepared is None:
++                    boundary, pre_mix = sp_all_gather(boundary), sp_all_gather(pre_mix)
++            if prepared is None:
++                normalized = self._ced_boundary_norm(source, boundary, pre_mix)
++                source.attn.build_ced_global_kv(normalized, positions)
++                rows = step.plan.num_input_tokens
++                prepared = self.ced_tail.pack(step.plan, boundary[:rows], pre_mix[:rows], input_ids[:rows])
+             deltas = self._pp_cache_deltas(positions.shape[0])
+-            rows = step.plan.num_input_tokens
+-            hidden, carried, token_ids = self.ced_tail.pack(
+-                step.plan, boundary[:rows], pre_mix[:rows], input_ids[:rows]
+-            )
++            hidden, carried, token_ids = prepared
+         else:
+             assert self.start_layer in (30, 31, 32) and replay_token_ids is not None
+             hidden, carried, token_ids = boundary, pre_mix, replay_token_ids
+@@ -1458,6 +1625,19 @@
+ 
+     def process_weights_after_loading(self) -> None:
+         self.model.finalize_mhc_broadcast_weights()
++        switch_path = os.getenv("DS1017_ADA_CED_SP_SWITCH")
++        if switch_path:
++            from .ada_wo_exchange import bind_ada_wo_exchange
++
++            if (
++                self.model.start_layer != 0
++                or not self.model.ced_enabled
++                or self.model.use_sequence_parallel
++                or self.model.vllm_config.parallel_config.pipeline_parallel_size != 1
++            ):
++                raise ValueError("Ada encoder sequence parallel requires the PP1 CED path")
++            bind_ada_wo_exchange(list(self.model.layers), 20, skip_engram=True)
++            self.model._ada_ced_sp_switch = Path(switch_path)
+         config = self.model.vllm_config
+         if config.engram_config and config.engram_config.use_thp:
+             # Loading weights refills the file cache; release it before MADV_COLLAPSE.

@@ -6,6 +6,17 @@ venv=$(realpath -m "${VENV:-$root/.venv-pex88096}")
 wheel_dir=$(realpath -m "${WHEEL_DIR:-$root/wheels}")
 patches="$root/patches/pex88096"
 overlay="$root/overlays/pex88096-vision14"
+checksums="$patches/overlay.sha256"
+patch_series=(prefill-indexer-sharding ada-prefill-tiles decode-indexer-sharding)
+case "${1:-}" in
+  '') ;;
+  --mode16)
+    overlay="$root/overlays/pex88096-vision14-mode16"
+    checksums="$patches/mode16/overlay.sha256"
+    patch_series+=(mode16/mode15-foundation mode16/mode16)
+    ;;
+  *) echo "Usage: $0 [--mode16]" >&2; exit 2 ;;
+esac
 release=https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.33.0-vision14-sm89-sm120-cu130
 vllm_wheel='vllm-0.33.0+glm53.dsv41.vision14.sm89sm120.cu130-cp312-cp312-linux_x86_64.whl'
 vllm_sha=8f400eb43378c4ce8191df298de344e559d32724b190376509ce49a3e10ae675
@@ -85,15 +96,15 @@ uv pip check --python "$venv/bin/python"
 
 site=$("$venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
 if [[ -e "$overlay" ]]; then
-  (cd "$overlay" && sha256sum --check "$patches/overlay.sha256")
+  (cd "$overlay" && sha256sum --check "$checksums")
 else
   mkdir "$scratch/overlay"
   cp -a "$site/vllm" "$scratch/overlay/"
-  for patch in prefill-indexer-sharding ada-prefill-tiles decode-indexer-sharding; do
+  for patch in "${patch_series[@]}"; do
     patch --directory "$scratch/overlay" --batch --forward --fuzz=0 -p1 < "$patches/$patch.patch"
   done
-  (cd "$scratch/overlay" && sha256sum --check "$patches/overlay.sha256")
+  (cd "$scratch/overlay" && sha256sum --check "$checksums")
   mv -T --no-clobber "$scratch/overlay" "$overlay"
-  (cd "$overlay" && sha256sum --check "$patches/overlay.sha256")
+  (cd "$overlay" && sha256sum --check "$checksums")
 fi
 printf 'PEX88096 environment ready at %s\n' "$venv"
