@@ -98,7 +98,7 @@ ENV_FILE="$PWD/.env.pex88096" ./tools/smoke-test.sh
 | `burst8late` 长短请求调度 | 独立 C8 对照中，短流输出片间隔 p95 从 978–985 ms 降至 556–562 ms，512K 长流 TTFT 从 59.82–60.42 s 降至 47.68–48.03 s |
 | 联合验收 | 一个约 256K 长流和七个短流均完成，零前缀缓存命中 |
 
-窄包和调度的收益分别来自各自的单变量配对。窄包路由和激活在逐层样本上逐位一致，Marlin 最终输出仍有少量 BF16 位差。 [脱敏单流数据](results/mode16-prefill.jsonl) · [脱敏调度数据](results/mode16-scheduler.jsonl)
+窄包和调度的收益分别来自各自的单变量配对。窄包路由和激活在逐层样本上逐位一致，Marlin 最终输出仍有少量 BF16 位差。 [单流测试数据](results/mode16-prefill.jsonl) · [调度测试数据](results/mode16-scheduler.jsonl)
 
 完成基础配置和模型下载后，手动启动档 16。服务默认监听本机。
 
