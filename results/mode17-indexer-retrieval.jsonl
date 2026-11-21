@@ -1,0 +1,2 @@
+{"variant": "mode16", "target": 524288, "seed": 22571, "prompt_tokens": 524253, "output_tokens": 12, "cached_tokens": 0, "engine_prefill_s": 37.00069005903788, "ttft_s": 39.0017633959651, "sha": "d47480d1361b7543", "codes_correct": true, "finish": "stop"}
+{"variant": "mode17", "target": 524288, "seed": 22571, "prompt_tokens": 524253, "output_tokens": 14, "cached_tokens": 0, "engine_prefill_s": 36.00684970105067, "ttft_s": 38.006271281978115, "sha": "c283c2040e31764e", "codes_correct": true, "finish": "stop"}

@@ -58,6 +58,14 @@ if [[ "${PEX88096_MODE16:-0}" == "1" ]]; then
   export DS1017_ADA_PACK_EXPERT_SCALES=0
 fi
 
+if [[ "${PEX88096_MODE17:-0}" == "1" ]]; then
+  : "${DS1017_STAGED_K:=1}"
+  case "$DS1017_STAGED_K" in
+    0|1) export DS1017_STAGED_K ;;
+    *) echo 'DS1017_STAGED_K must be 0 or 1.' >&2; exit 1 ;;
+  esac
+fi
+
 : "${NCCL_P2P_DISABLE:=1}"
 export CUDA_VISIBLE_DEVICES NCCL_P2P_DISABLE
 
@@ -88,7 +96,10 @@ args=(
 if [[ "${PEX88096_PROFILE:-0}" == "1" ]]; then
   overlay="$PROJECT_DIR/overlays/pex88096-vision14"
   setup_args=
-  if [[ "${PEX88096_MODE16:-0}" == "1" ]]; then
+  if [[ "${PEX88096_MODE17:-0}" == "1" ]]; then
+    overlay+="-mode17"
+    setup_args=' --mode17'
+  elif [[ "${PEX88096_MODE16:-0}" == "1" ]]; then
     overlay+="-mode16"
     setup_args=' --mode16'
   fi
@@ -136,6 +147,9 @@ fi
 
 echo "Starting $SERVED_MODEL_NAME on GPUs $CUDA_VISIBLE_DEVICES"
 echo "Context=$MAX_MODEL_LEN DSpark=$ENABLE_DSPARK/$NUM_SPECULATIVE_TOKENS CED=$ENABLE_CED prefix_cache=$ENABLE_PREFIX_CACHING vision=$ENABLE_VISION/$MAX_IMAGES_PER_PROMPT"
+if [[ "${PEX88096_MODE17:-0}" == "1" ]]; then
+  echo "Indexer K staging=$DS1017_STAGED_K"
+fi
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf 'vllm'
   printf ' %q' "${args[@]}"

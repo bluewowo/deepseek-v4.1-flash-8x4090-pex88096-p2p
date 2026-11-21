@@ -1,0 +1,264 @@
+--- a/vllm/model_executor/kernels/attention/dsa/dsv41_indexer.py
++++ b/vllm/model_executor/kernels/attention/dsa/dsv41_indexer.py
+@@ -132,6 +132,8 @@
+     BLOCK_N: tl.constexpr,
+     Q_PREDECODED: tl.constexpr,
+     FP4_DOT: tl.constexpr,
++    STAGED_K: tl.constexpr = False,
++    STAGED_VALID = None,
+ ):
+     row = tl.program_id(0).to(tl.int64)
+     first_tile = tl.program_id(1)
+@@ -256,17 +258,28 @@
+                 token = cols
+                 valid = (cols < width) & (token < end)
+
+-        logical_block = token // PAGE_SIZE
+-        block_offset = token % PAGE_SIZE
+-        valid = valid & (token >= 0) & (logical_block < block_table_width)
+-        physical_block = tl.load(
+-            block_tables + tile_req * block_table_stride + logical_block,
+-            mask=valid,
+-            other=-1,
+-        ).to(tl.int64)
+-        valid = valid & (physical_block >= 0) & (physical_block < num_cache_blocks)
+-
+-        if FP4_DOT:
++        if STAGED_K:
++            valid = valid & tl.load(STAGED_VALID + token, mask=valid, other=False)
++        else:
++            logical_block = token // PAGE_SIZE
++            block_offset = token % PAGE_SIZE
++            valid = valid & (token >= 0) & (logical_block < block_table_width)
++            physical_block = tl.load(
++                block_tables + tile_req * block_table_stride + logical_block,
++                mask=valid,
++                other=-1,
++            ).to(tl.int64)
++            valid = valid & (physical_block >= 0) & (physical_block < num_cache_blocks)
++
++        if STAGED_K:
++            k = tl.load(
++                k_cache + token[None, :] * _INDEX_HEAD_DIM + dims[:, None],
++                mask=valid[None, :],
++                other=0,
++                eviction_policy="evict_last",
++            )
++            head_scores = tl.dot(q.to(tl.bfloat16), k)
++        elif FP4_DOT:
+             # K stays packed too: [64 bytes, BLOCK_N] values and [BLOCK_N, 4]
+             # scales (dot_scaled wants rhs scales as [N, K // 32]).
+             value_offsets = (
+@@ -742,3 +755,120 @@
+     "dsv41_mxfp4_dense_logits",
+     "map_candidate_topk_",
+ ]
++
++
++@triton.jit
++def _stage_logical_k(
++    cache, table, decoded, live, width, cache_stride,
++    PAGE: tl.constexpr, NUM_PAGES: tl.constexpr, BLOCK: tl.constexpr,
++):
++    tokens = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++    dims = tl.arange(0, _INDEX_HEAD_DIM)
++    physical = tl.load(
++        table + tokens // PAGE, mask=tokens < width, other=-1
++    ).to(tl.int64)
++    offset = tokens % PAGE
++    valid = (tokens < width) & (physical >= 0) & (physical < NUM_PAGES)
++    base = physical[:, None] * cache_stride
++    bits = tl.load(
++        cache + base + offset[:, None] * 64 + dims[None, :] // 2,
++        mask=valid[:, None],
++        other=0,
++    )
++    scales = tl.load(
++        cache + base + PAGE * 64 + offset[:, None] * 4 + dims[None, :] // 32,
++        mask=valid[:, None],
++        other=127,
++    )
++    nibbles = tl.where((dims[None, :] & 1) == 0, bits & 15, bits >> 4)
++    data = _decode_e2m1(nibbles) * tl.exp2(scales.to(tl.float32) - 127.0)
++    tl.store(
++        decoded + tokens[:, None] * _INDEX_HEAD_DIM + dims[None, :],
++        data.to(tl.bfloat16),
++        mask=(tokens < width)[:, None],
++    )
++    tl.store(live + tokens, valid, mask=tokens < width)
++
++
++def prepare_logical_k(
++    cache: torch.Tensor, table: torch.Tensor, width: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Decode one request's visible MXFP4 indexer keys in logical token order."""
++    page = cache.shape[1]
++    assert table.shape[0] == 1 and (width + page - 1) // page <= table.shape[1]
++    dense = torch.empty(
++        (width, INDEX_HEAD_DIM), dtype=torch.bfloat16, device=cache.device
++    )
++    live = torch.empty(width, dtype=torch.bool, device=cache.device)
++    _stage_logical_k[(triton.cdiv(width, 16),)](
++        cache,
++        table,
++        dense,
++        live,
++        width,
++        cache.stride(0),
++        PAGE=page,
++        NUM_PAGES=cache.shape[0],
++        BLOCK=16,
++        num_warps=4,
++    )
++    return dense, live
++
++
++def score_with_logical_k(
++    q_values: torch.Tensor,
++    q_scales: torch.Tensor,
++    weights: torch.Tensor,
++    starts: torch.Tensor,
++    ends: torch.Tensor,
++    cu_seq_lens: torch.Tensor,
++    token_to_seq: torch.Tensor,
++    keys: torch.Tensor,
++    live: torch.Tensor,
++    out: torch.Tensor,
++) -> torch.Tensor:
++    """Run the SM89 BF16 dense scorer with the chunk's decoded keys."""
++    rows, width = out.shape
++    q_values = q_values.reshape(rows, INDEX_HEADS, PACKED_HEAD_DIM)
++    q_scales = q_scales.reshape(rows, INDEX_HEADS, SCALES_PER_HEAD)
++    weights = weights.reshape(rows, INDEX_HEADS)
++    q_predecoded = _use_q_predecode(q_values.device)
++    q_decoded = _predecode_q(q_values, q_scales) if q_predecoded else q_values
++    _mxfp4_indexer_logits_kernel[_logits_launch_grid(rows, width, 128)](
++        q_values,
++        q_scales,
++        q_decoded,
++        keys,
++        weights,
++        None,
++        starts,
++        ends,
++        cu_seq_lens,
++        token_to_seq,
++        None,
++        out,
++        q_values.stride(0),
++        q_values.stride(1),
++        q_scales.stride(0),
++        q_scales.stride(1),
++        weights.stride(0),
++        0,  # No block table or packed-cache stride for logical keys.
++        0,
++        out.stride(0),
++        0,
++        0,
++        width,
++        PAGE_SIZE=64,
++        ROW_REPEAT=1,
++        PREFILL=True,
++        USE_CANDIDATES=False,
++        CANDIDATE_STRIDE_ROW=0,
++        BLOCK_N=128,
++        Q_PREDECODED=q_predecoded,
++        FP4_DOT=False,
++        STAGED_K=True,
++        STAGED_VALID=live,
++        num_warps=4,
++        num_stages=1,
++    )
++    return out
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -43,6 +43,8 @@
+     dsv41_mxfp4_candidate_logits,
+     dsv41_mxfp4_dense_logits,
+     map_candidate_topk_,
++    prepare_logical_k,
++    score_with_logical_k,
+ )
+ from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
+     fused_mqa_topk_chunk,
+@@ -682,7 +684,7 @@
+     candidate_block_size: int,
+     candidate_write: bool,
+ ) -> torch.Tensor:
+-    """Run the V4.1 MXFP4 indexer without DeepGEMM or dense K expansion."""
++    """Run the native V4.1 MXFP4 indexer."""
+     if candidate_write and candidate_blocks is None:
+         raise ValueError("V4.1 candidate source requires a candidate output buffer")
+     if candidate_blocks is not None:
+@@ -713,6 +715,25 @@
+                 width = candidate_blocks.shape[1] * candidate_block_size
+             else:
+                 width = chunk.local_total_seq_lens
++            staged = None
++            if (
++                os.environ.get("DS1017_STAGED_K") == "1"
++                and not reads_candidates
++                and attn_metadata.num_decodes == 0
++                and attn_metadata.num_prefills == 1
++                and chunk.num_reqs == 1
++                and chunk.pcp_deinterleave_idx is None
++                and width == chunk.total_seq_lens
++                and 16384 <= width <= 262144
++                and chunk.token_end - chunk.token_start >= 1024
++                and chunk.block_table.shape[0] == 1
++                and chunk.block_table.stride(1) == 1
++                and triton.cdiv(width, kv_cache.shape[1]) <= chunk.block_table.shape[1]
++                and torch.cuda.get_device_capability(kv_cache.device) == (8, 9)
++                and not torch.cuda.is_current_stream_capturing()
++            ):
++                staged = prepare_logical_k(kv_cache, chunk.block_table, width)
++                logger.info_once("Ada staged-K dense prefill executed")
+             rows_per_chunk = _dsv41_rows_per_chunk(
+                 width,
+                 logits_scratch.numel(),
+@@ -767,19 +788,32 @@
+                         )
+                         continue
+
+-                    logits = dsv41_mxfp4_dense_logits(
+-                        q_values,
+-                        q_scales,
+-                        kv_cache,
+-                        chunk_weights,
+-                        chunk.block_table,
+-                        chunk.cu_seqlen_ke[local_rows],
+-                        width,
+-                        row_starts=chunk.cu_seqlen_ks[local_rows],
+-                        cu_seq_lens=chunk.cu_seq_lens,
+-                        token_to_seq=chunk.token_to_seq,
+-                        out=logits_out,
+-                    )
++                    if staged is not None:
++                        logits = score_with_logical_k(
++                            q_values,
++                            q_scales,
++                            chunk_weights,
++                            chunk.cu_seqlen_ks[local_rows],
++                            chunk.cu_seqlen_ke[local_rows],
++                            chunk.cu_seq_lens,
++                            chunk.token_to_seq,
++                            *staged,
++                            logits_out,
++                        )
++                    else:
++                        logits = dsv41_mxfp4_dense_logits(
++                            q_values,
++                            q_scales,
++                            kv_cache,
++                            chunk_weights,
++                            chunk.block_table,
++                            chunk.cu_seqlen_ke[local_rows],
++                            width,
++                            row_starts=chunk.cu_seqlen_ks[local_rows],
++                            cu_seq_lens=chunk.cu_seq_lens,
++                            token_to_seq=chunk.token_to_seq,
++                            out=logits_out,
++                        )
+                     if chunk_candidates is not None:
+                         num_blocks = (
+                             width + candidate_block_size - 1

@@ -108,10 +108,22 @@ DRY_RUN=1 ./launch_pex88096_mode16.sh
 ./launch_pex88096_mode16.sh
 ```
 
+## 档 17 · Indexer K 暂存
+
+档 17 在档 16 的基础上，将符合条件的 SM89 单请求 prefill 的 MXFP4 Indexer K 一次解包到 BF16 暂存区，供该块的各行打分复用。512K 冷 prefill 实测 **14,551 tok/s**，相对同实例档 16 **提升 2.64%**。128K 为 **16,434 tok/s，提升 3.05%**。这些数据使用两组匹配种子，前缀缓存命中为零。 [档 17 部署、触发条件与数值验证](docs/mode17.md) · [原始配对记录](results/mode17-indexer-prefill.jsonl)
+
+档 17 沿用 1,048,576 token 配置窗口、8 个活动序列、DSpark K7 和 `burst8late` 调度。真实 128K 抽检的 3.08 亿个打分值逐位一致。512K 的两边检索均找回三处号码，生成文本有差异。C8 请求分片采样列为待选。 [16→17 实验结案](docs/mode17-experiments.md)
+
+```bash
+./setup_pex88096.sh --mode17
+DRY_RUN=1 ./launch_pex88096_mode17.sh
+./launch_pex88096_mode17.sh
+```
+
 ## 项目来源
 
 本项目 fork 自 ykk648 的八卡部署。1017 运行时来自 vLLM SM89 fork。解码索引行分片、序列并行和窄包设计参考 Spark 的相应实验，`burst8late` 按本机 8192 行快路径设计。 [上游部署](https://github.com/ykk648/deepseek-v4.1-flash-8x4090) · [vLLM SM89](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89) · [Spark 索引分片](https://github.com/christopherowen/spark-ds41f/blob/8e5ea208f3d22bc69df91ace94d6975932c858a8/patches/vllm/0025-deepseek-v41-indexer-sp-split.patch) · [档 16 机制及引用](docs/mode16.md) · [MIT](LICENSE) · [vLLM Apache-2.0](patches/pex88096/licenses/vllm-LICENSE)
 
 ## English summary
 
-Single-node DeepSeek V4.1 Flash 1017 on eight 48 GB RTX 4090s connected through two PEX88096 switches. The base profile configures PCIe P2P, shards prefill and decode indexer rows, and tunes an Ada prefill GEMM tile. It measured 10,712 cold prefill tok/s and 211.6 decode tok/s at 512K. Mode 15 adds sequence-parallel prefill, compact CED, and reduce-scatter. Mode 16 builds on Mode 15 with MXFP8 FFN input packets and mixed-length scheduling. Its paired 512K result was 14,183 cold prefill tok/s, up 4.23% from Mode 15. [Base deployment](docs/pex88096.md) · [Modes 15 and 16](docs/mode16.md)
+Single-node DeepSeek V4.1 Flash 1017 on eight 48 GB RTX 4090s connected through two PEX88096 switches. The base profile configures PCIe P2P, shards prefill and decode indexer rows, and tunes an Ada prefill GEMM tile. It measured 10,712 cold prefill tok/s and 211.6 decode tok/s at 512K. Mode 15 adds sequence-parallel prefill, compact CED, and reduce-scatter. Mode 16 builds on Mode 15 with MXFP8 FFN input packets and mixed-length scheduling. Its paired 512K result was 14,183 cold prefill tok/s, up 4.23% from Mode 15. Mode 17 adds staged Indexer K decoding for single-stream prefill and reaches 14,551 cold prefill tok/s at 512K, up 2.64% in the paired comparison with Mode 16. [Base deployment](docs/pex88096.md) · [Modes 15 and 16](docs/mode16.md) · [Mode 17](docs/mode17.md)
